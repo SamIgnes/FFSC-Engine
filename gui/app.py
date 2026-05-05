@@ -14,8 +14,8 @@ from core.thermodynamics import CH4RealGasProps, CEA_MethaloxCombustion
 from core.engine import FFSCC_Engine
 from core.avionics import FlightComputer
 from config import K_HEAD
-from nozzle import SpacialNozzleModel
-from structures import StructuralAnalyzer
+from core.nozzle import SpacialNozzleModel
+from core.structures import StructuralAnalyzer
 
 # ── Palette colori ─────────────────────────────────────────────────────────────
 BG_FIG   = '#0d1b2a'
