@@ -7,8 +7,8 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
-from engine import FFSCC_Engine
-from avionics import FlightComputer
+from core.engine import FFSCC_Engine
+from core.avionics import FlightComputer
 from config import SIM_DT as DT, SIM_T_TOTAL as T_TOTAL, SIM_START_SEQ as START_SEQ, SIM_TARGET_KN as TARGET_KN, K_HEAD
 
 N      = int(T_TOTAL / DT)

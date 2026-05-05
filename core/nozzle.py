@@ -4,7 +4,7 @@ Modello termico spaziale 1-D dell'ugello (parete in rame, 4 nodi radiali).
 """
 import numpy as np
 from scipy.optimize import fsolve
-from thermodynamics import CH4RealGasProps, CEA_MethaloxCombustion, _COOLPROP_OK
+from core.thermodynamics import CH4RealGasProps, CEA_MethaloxCombustion, _COOLPROP_OK
 
 try:
     import CoolProp.CoolProp as CP

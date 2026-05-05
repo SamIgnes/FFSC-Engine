@@ -1,9 +1,9 @@
 import numpy as np
 from scipy.integrate import solve_ivp
 
-from thermodynamics import CH4RealGasProps, CEA_MethaloxCombustion
-from avionics import ProportionalValve
-from subsystems import Turbopump, CoolingJacket, CombustionChamber
+from core.thermodynamics import CH4RealGasProps, CEA_MethaloxCombustion
+from core.avionics import ProportionalValve
+from core.subsystems import Turbopump, CoolingJacket, CombustionChamber
 from config import (
     K_HEAD,
     RHO_LOX, RHO_LCH4_NOM,

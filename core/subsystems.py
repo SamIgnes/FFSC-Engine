@@ -1,5 +1,5 @@
 import numpy as np
-from thermodynamics import (
+from core.thermodynamics import (
     CH4RealGasProps, MethaloxProperties,
     CEA_MethaloxCombustion, PropellantPhysics,
 )

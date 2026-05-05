@@ -10,7 +10,7 @@ La logica è ora suddivisa in moduli separati:
     nozzle.py          – SpacialNozzleModel (termico 1D ugello)
     gui.py             – AppGUI (Tkinter + matplotlib live)
 """
-from gui import AppGUI
+from gui.app import AppGUI
 import tkinter as tk
 
 if __name__ == "__main__":

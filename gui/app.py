@@ -10,9 +10,9 @@ from matplotlib.figure import Figure
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 import matplotlib.patches as mpatches
 
-from thermodynamics import CH4RealGasProps, CEA_MethaloxCombustion
-from engine import FFSCC_Engine
-from avionics import FlightComputer
+from core.thermodynamics import CH4RealGasProps, CEA_MethaloxCombustion
+from core.engine import FFSCC_Engine
+from core.avionics import FlightComputer
 from config import K_HEAD
 from nozzle import SpacialNozzleModel
 from structures import StructuralAnalyzer
