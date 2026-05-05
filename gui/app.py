@@ -14,7 +14,6 @@ from core.thermodynamics import CH4RealGasProps, CEA_MethaloxCombustion
 from core.engine import FFSCC_Engine
 from core.avionics import FlightComputer
 from config import K_HEAD
-from core.nozzle import SpacialNozzleModel
 from core.structures import StructuralAnalyzer
 
 # ── Palette colori ─────────────────────────────────────────────────────────────
@@ -103,7 +102,7 @@ class AppGUI:
             'mdot_ox', 'mdot_f',
         ]}
 
-        self.spatial_model  = SpacialNozzleModel()
+        # spatial_nozzle è ora di proprietà dell'engine (operator splitting)
         self.struct_analyzer = StructuralAnalyzer()
         self._right_panel   = "SCHEMA"   # "SCHEMA" | "NOZZLE" | "STRUCT"
 
@@ -624,7 +623,7 @@ class AppGUI:
         t_frhc   = engine.t_frhc_current
 
         # Dati profilo completo dal modello ugello
-        sm = self.spatial_model
+        sm = engine.spatial_nozzle
         p_cool_bar = getattr(engine, 'coolant_pressure_bar', 200.0)
         try:
             i_throat = int(np.argmin(sm.A))
@@ -874,29 +873,21 @@ class AppGUI:
             elif self._right_panel == "STRUCT":
                 self._draw_struct(st, self.engine)
             else:
-                P_mcc_pa   = st[0]
-                mdot_f_noz = self.engine.mdot_f_last
-                mdot_o_noz = self.engine.mdot_ox_last
-                if self.engine.is_ignited and mdot_f_noz > 0.01:
-                    of_noz     = mdot_o_noz / max(mdot_f_noz, 0.01)
-                    T_camera   = CEA_MethaloxCombustion.get_t_ad(of_noz, P_mcc_pa / 1e5)
-                    c_star_eff = (CEA_MethaloxCombustion.get_c_star(of_noz, P_mcc_pa / 1e5)
-                                  * self.engine.mcc.eta_cstar)
+                # Il modello 1D è già aggiornato dall'engine ad ogni step.
+                # La GUI legge direttamente i profili precalcolati.
+                sn = self.engine.spatial_nozzle
+                of_noz = self.engine.mdot_ox_last / max(self.engine.mdot_f_last, 0.01)
+                P_bar  = st[0] / 1e5
+                if self.engine.is_ignited and self.engine.mdot_f_last > 0.01:
+                    T_camera = CEA_MethaloxCombustion.get_t_ad(of_noz, P_bar)
+                    T_gas    = T_camera / sn.temp_ratio
                 else:
-                    T_camera   = 300.0
-                    c_star_eff = 300.0
-
-                cool_p = self.engine.coolant_pressure_bar
-                x_vals, tgas_vals, t_hw_hot, t_hw_cold, t_cool_noz, t_cw = \
-                    self.spatial_model.compute_instantaneous_profile(
-                        P_mcc_pa, T_camera, c_star_eff, mdot_f_noz, 120.0, self.dt,
-                        coolant_pressure_bar=cool_p,
-                    )
-                self.l_gas.set_data(x_vals, tgas_vals)
-                self.l_hw_hot.set_data(x_vals, t_hw_hot)
-                self.l_hw_cold.set_data(x_vals, t_hw_cold)
-                self.l_cool.set_data(x_vals, t_cool_noz)
-                self.l_cw.set_data(x_vals, t_cw)
+                    T_gas = np.full_like(sn.x, 300.0)
+                self.l_gas.set_data(sn.x, T_gas)
+                self.l_hw_hot.set_data(sn.x, sn.T_hw_rad[:, 0])
+                self.l_hw_cold.set_data(sn.x, sn.T_hw_rad[:, -1])
+                self.l_cool.set_data(sn.x, sn.T_cool)
+                self.l_cw.set_data(sn.x, sn.T_cw)
 
             self.canvas.draw_idle()
             self.root.update_idletasks() # Obbliga Tkinter a processare gli eventi in background sbloccando la GUI

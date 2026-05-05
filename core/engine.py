@@ -4,6 +4,7 @@ from scipy.integrate import solve_ivp
 from core.thermodynamics import CH4RealGasProps, CEA_MethaloxCombustion
 from core.avionics import ProportionalValve
 from core.subsystems import Turbopump, CoolingJacket, CombustionChamber
+from core.nozzle import SpacialNozzleModel
 from config import (
     K_HEAD,
     RHO_LOX, RHO_LCH4_NOM,
@@ -24,6 +25,7 @@ from config import (
     JACKET_H_COOL, JACKET_MDOT_NOM,
     AUTOG_RATE, AUTOG_BLEED_OX, AUTOG_BLEED_F,
     STARTER_TORQUE, STARTER_TAU_BAR,
+    JACKET_MDOT_NOM,
 )
 
 
@@ -122,6 +124,10 @@ class FFSCC_Engine:
         self.h_tank_ox_m = TANK_H_OX_M
         self.h_tank_f_m  = TANK_H_F_M
         self.g_force     = 1.0
+
+        # Modello termico 1D ugello (operator splitting: aggiornato post-step)
+        self.spatial_nozzle = SpacialNozzleModel()
+        self.T_wall_max     = 300.0   # [K] temperatura massima parete lato gas (diagnostica)
 
     def get_current_thrust(self):
         st = self.state
@@ -371,4 +377,48 @@ class FFSCC_Engine:
         self.state[1] = max(0.0, self.state[1])  # w_ox
         self.state[2] = max(0.0, self.state[2])  # w_f
         self._update_diagnostics(self.state)
+        self._update_nozzle_thermal(dt)
         self.current_time += dt
+
+    def _update_nozzle_thermal(self, dt):
+        """
+        Aggiorna il modello termico 1D ugello in parallelo all'ODE (accoppiamento lasco).
+
+        Il modello 0D CoolingJacket rimane l'autorità per state[7] (T_cool)
+        perché la geometria dei canali del modello 1D è calibrata su mdot_nom ≠ mdot reale.
+
+        Il modello 1D fornisce:
+          - Profilo spaziale T_gas, T_wall, T_cool lungo l'ugello (display GUI)
+          - T_wall_max: temperatura massima parete lato gas (analisi strutturale + abort futuro)
+
+        Riceve le condizioni al contorno aggiornate dal motore ogni step:
+          - P_mcc, T_ad, c_star (termochimica reale)
+          - mdot_coolant scalato al mdot nominale del jacket (geometria canali)
+          - T_inlet = temperatura serbatoio CH4
+        """
+        if not self.is_ignited:
+            self.T_wall_max = 300.0
+            return
+
+        P_mcc_pa = float(self.state[0])
+        mdot_f   = max(self.mdot_f_last, 0.1)
+        of_mcc   = self.mdot_ox_last / max(mdot_f, 0.01)
+        P_bar    = P_mcc_pa / 1e5
+
+        T_c    = CEA_MethaloxCombustion.get_t_ad(of_mcc, P_bar)
+        c_star = CEA_MethaloxCombustion.get_c_star(of_mcc, P_bar) * self.mcc.eta_cstar
+
+        # Usa mdot nominale jacket: la geometria dei canali è calibrata su JACKET_MDOT_NOM.
+        # Il flusso reale (mdot_f_last) è proporzionalmente più alto ma la distribuzione
+        # spaziale del profilo termico rimane rappresentativa.
+        mdot_jacket = JACKET_MDOT_NOM * (mdot_f / max(self.jacket.mdot_nom, 1.0))
+
+        self.spatial_nozzle.compute_instantaneous_profile(
+            P_mcc_pa, T_c, c_star, mdot_jacket,
+            T_inlet=self.t_tank_f, dt=dt,
+            coolant_pressure_bar=self.coolant_pressure_bar,
+        )
+
+        # NON sovrascrivere state[7]: T_cool è gestita dall'ODE via CoolingJacket 0D.
+        # Esporta solo la diagnostica strutturale.
+        self.T_wall_max = float(np.max(self.spatial_nozzle.T_hw_rad[:, 0]))
