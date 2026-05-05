@@ -154,14 +154,31 @@ VALVE_ORHC_NOMINAL  = 0.20  # posizione nominale v_orhc in MAIN_STAGE
 VALVE_FRHC_NOMINAL  = 0.60  # posizione nominale v_frhc in MAIN_STAGE
 
 # ── Avionics: sequenza accensione ────────────────────────────────────────────
-SEQ_CHILLDOWN_T  = 2.0    # [s] durata chilldown
-SEQ_SPINPRIME_T  = 1.5    # [s] durata spin/prime
-SEQ_BOOTSTRAP_TO = 8.0    # [s] timeout IGNITION → ABORT "BOOTSTRAP FAILED"
-SEQ_IGNITION_RPM_F  = 3000.0  # [RPM] soglia fuel pump per transizione IGNITION→RAMP_UP
-SEQ_IGNITION_RPM_OX = 1500.0  # [RPM] soglia ox pump per transizione IGNITION→RAMP_UP
-SEQ_RAMPUP_THRUST   = 2600.0  # [kN] early-exit RAMP_UP se spinta raggiunta
-SEQ_RAMPUP_DURATION = 5.0     # [s]  durata rampa RAMP_UP
-THRUST_RATE_KN_S    = 1200.0  # [kN/s] max rate di variazione spinta in MAIN_STAGE
+
+# CHILLDOWN → SPIN_PRIME
+# Condizione primaria: T_cool ≤ soglia (propellante freddo a sufficienza)
+# Guard timer: tempo minimo anche se il sensore è già soddisfatto (evita falsi positivi)
+SEQ_CHILLDOWN_T_COOL_MAX = 125.0  # [K]   T_cool deve scendere sotto questa soglia
+SEQ_CHILLDOWN_T_MIN      = 1.0    # [s]   tempo minimo nella fase (guard)
+SEQ_CHILLDOWN_TO         = 30.0   # [s]   timeout → abort "CHILLDOWN TIMEOUT"
+
+# SPIN_PRIME → IGNITION
+# Condizione primaria: RPM pompe > soglia (linee idrualiche in pressione)
+# Condizione secondaria: pressioni serbatoi OK
+SEQ_SPINPRIME_RPM_MIN    = 200.0  # [RPM] entrambe le pompe devono girare
+SEQ_SPINPRIME_P_TANK_MIN = 5.0    # [bar] entrambi i serbatoi pressurizati
+SEQ_SPINPRIME_T_MIN      = 0.5    # [s]   tempo minimo nella fase (guard)
+SEQ_SPINPRIME_TO         = 5.0    # [s]   timeout → abort "SPIN_PRIME TIMEOUT"
+
+# IGNITION → RAMP_UP (bootstrap termico confermato)
+SEQ_IGNITION_RPM_F  = 3000.0  # [RPM] fuel pump
+SEQ_IGNITION_RPM_OX = 1500.0  # [RPM] ox pump
+SEQ_BOOTSTRAP_TO    = 8.0     # [s]   timeout → abort "BOOTSTRAP FAILED"
+
+# RAMP_UP → MAIN_STAGE
+SEQ_RAMPUP_THRUST   = 2600.0  # [kN] early-exit se spinta raggiunta
+SEQ_RAMPUP_DURATION = 5.0     # [s]  durata massima rampa
+THRUST_RATE_KN_S    = 1200.0  # [kN/s] max rate variazione spinta in MAIN_STAGE
 
 # Aperture valvole durante IGNITION
 IGN_TH_MOV  = 0.40

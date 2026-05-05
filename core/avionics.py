@@ -10,8 +10,9 @@ from config import (
     TRIM_OF_MCC_MAX, TRIM_ORHC_MAX, TRIM_FRHC_MAX,
     VALVE_ORHC_NOMINAL, VALVE_FRHC_NOMINAL,
     ABORT_P_MCC_BAR, ABORT_RPM_LIMIT, ABORT_T_COOL_K, ABORT_P_TANK_BAR,
-    SEQ_CHILLDOWN_T, SEQ_SPINPRIME_T, SEQ_BOOTSTRAP_TO,
-    SEQ_IGNITION_RPM_F, SEQ_IGNITION_RPM_OX,
+    SEQ_CHILLDOWN_T_COOL_MAX, SEQ_CHILLDOWN_T_MIN, SEQ_CHILLDOWN_TO,
+    SEQ_SPINPRIME_RPM_MIN, SEQ_SPINPRIME_P_TANK_MIN, SEQ_SPINPRIME_T_MIN, SEQ_SPINPRIME_TO,
+    SEQ_BOOTSTRAP_TO, SEQ_IGNITION_RPM_F, SEQ_IGNITION_RPM_OX,
     SEQ_RAMPUP_THRUST, SEQ_RAMPUP_DURATION, THRUST_RATE_KN_S,
     IGN_TH_MOV, IGN_TH_MFV, IGN_V_FRHC, IGN_V_ORHC,
     RAMP_TH_MOV_0, RAMP_TH_MOV_1,
@@ -104,14 +105,22 @@ class FlightComputer:
 
         elif self.state == "CHILLDOWN":
             v_auto_f = self.pid_chilldown.compute(t_cool, self.target_t_chilldown)
-            if self.timer >= SEQ_CHILLDOWN_T:
+            # Transizione sensore-based: T_cool sotto soglia + guard timer minimo
+            if t_cool <= SEQ_CHILLDOWN_T_COOL_MAX and self.timer >= SEQ_CHILLDOWN_T_MIN:
                 self.state, self.timer = "SPIN_PRIME", 0.0
+            elif self.timer > SEQ_CHILLDOWN_TO:
+                self.abort("CHILLDOWN TIMEOUT")
 
         elif self.state == "SPIN_PRIME":
             th_mov, th_mfv = 0.10, 0.20
             v_frhc, v_orhc = 0.0, 0.0
-            if self.timer >= SEQ_SPINPRIME_T:
+            # Transizione sensore-based: RPM confermano flusso + serbatoi pressurizzati
+            pumps_spinning = rpm_ox >= SEQ_SPINPRIME_RPM_MIN and rpm_f >= SEQ_SPINPRIME_RPM_MIN
+            tanks_ok       = p_tank_ox >= SEQ_SPINPRIME_P_TANK_MIN and p_tank_f >= SEQ_SPINPRIME_P_TANK_MIN
+            if pumps_spinning and tanks_ok and self.timer >= SEQ_SPINPRIME_T_MIN:
                 self.state, self.timer = "IGNITION", 0.0
+            elif self.timer > SEQ_SPINPRIME_TO:
+                self.abort("SPIN_PRIME TIMEOUT")
 
         elif self.state == "IGNITION":
             is_ignited = True
