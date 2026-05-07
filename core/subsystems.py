@@ -3,6 +3,7 @@ from core.thermodynamics import (
     CH4RealGasProps, MethaloxProperties,
     CEA_MethaloxCombustion, PropellantPhysics,
 )
+from config import TP_ETA_TURBINE
 
 
 class Turbopump:
@@ -34,9 +35,9 @@ class Turbopump:
 
         cav_factor = 1.0
         self.is_cavitating = False
-        if npsh_avail < npsh_req:
-            self.is_cavitating = True
-            cav_factor = max(0.01, 1.0 - (npsh_req - npsh_avail) * 2.0)
+        # if npsh_avail < npsh_req:
+        #     self.is_cavitating = True
+        #     cav_factor = max(0.01, 1.0 - (npsh_req - npsh_avail) * 2.0)
 
         tau_p = (self.pump_k1 * rpm**2 + self.pump_k2 * rpm * p_out_pump_bar) * cav_factor
 
@@ -47,7 +48,7 @@ class Turbopump:
         # ── Lato turbina (termodinamica reale) ────────────────────────────────
         if p_in_turb_bar > p_out_turb_bar and mdot_turb > 0.01 and t_in_turb > 50.0:
             pr        = max(1e-6, p_out_turb_bar / p_in_turb_bar)
-            eta_t     = 0.70
+            eta_t     = TP_ETA_TURBINE
             exp       = (gamma - 1.0) / gamma
             power_W   = mdot_turb * cp_gas * t_in_turb * eta_t * (1.0 - pr**exp)
             omega     = max(rpm * np.pi / 30.0, 1.0)
@@ -58,8 +59,13 @@ class Turbopump:
         # Starter: soffiaggio idraulico prima dell'accensione
         tau_t = tau_t_thermo + starter_torque
 
-        # Freno aerodinamico oltre il regime nominale
-        tau_t *= max(0.0, 1.0 - (rpm / 38000.0))
+        # Freno aerodinamico: si attiva solo sopra la soglia di overspeed (35000 RPM).
+        # Prima di quella soglia NON riduce la coppia — il vecchio modello lineare
+        # da RPM=0 dimezzava la coppia al regime di progetto (22-30k RPM).
+        OVERSPEED_ONSET = 35000.0
+        OVERSPEED_LIMIT = 38000.0
+        if rpm > OVERSPEED_ONSET:
+            tau_t *= max(0.0, 1.0 - (rpm - OVERSPEED_ONSET) / (OVERSPEED_LIMIT - OVERSPEED_ONSET))
 
         # Conversione rad/s² → RPM/s: d(RPM)/dt = (30/π) · (τ/I)
         # La variabile di stato è in RPM, quindi la derivata deve esserlo.
@@ -140,9 +146,9 @@ class CombustionChamber:
         return cf * gauge_p * self.a_t / 1000.0
 
     def get_derivative(self, p_mcc_pa, mdot_ox, mdot_f, is_ignited,
-                       p_back_pa=None):
+                       p_back_pa=None, t_fuel=None):
         p_back   = p_back_pa if p_back_pa is not None else self.p_atm
-        cs_eff   = self.get_c_star_eff(mdot_ox, mdot_f, p_mcc_pa)
+        cs_eff   = self.get_c_star_eff(mdot_ox, mdot_f, p_mcc_pa, t_fuel=t_fuel)
         mdot_in  = mdot_ox + mdot_f
         mdot_out = self.get_exhaust_mass_flow(p_mcc_pa, is_ignited, cs_eff,
                                               p_back_pa=p_back)
@@ -150,8 +156,8 @@ class CombustionChamber:
         if is_ignited and mdot_f > 0.01:
             of    = self._of_ratio(mdot_ox, mdot_f)
             p_bar = p_mcc_pa / 1e5
-            t_fl  = CEA_MethaloxCombustion.get_t_ad(of, p_bar)
-            mw    = CEA_MethaloxCombustion.get_mw(of)
+            t_fl  = CEA_MethaloxCombustion.get_t_ad(of, p_bar, t_fuel=t_fuel)
+            mw    = CEA_MethaloxCombustion.get_mw(of, t_fuel=t_fuel)
             r_t   = (8314.0 / mw) * t_fl
         else:
             r_t = 1.0e5

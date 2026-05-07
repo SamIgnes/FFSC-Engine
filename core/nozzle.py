@@ -142,12 +142,17 @@ class SpacialNozzleModel:
 
     def compute_instantaneous_profile(self, P_c_pa, T_c, c_star, mdot_coolant, T_inlet, dt,
                                       coolant_pressure_bar: float = 200.0,
-                                      frac_chamber: float = 0.5):
+                                      frac_chamber: float = 0.5,
+                                      gamma_gas: float = 1.14,
+                                      mw_gas: float = 22.0,
+                                      k_gas: float = 0.15):
         """
         Raffreddamento bidirezionale: il CH4 entra alla gola (punto più caldo),
         si divide in due flussi paralleli:
           • frac_chamber  × mdot → risale verso la camera di combustione
           • (1-frac_chamber) × mdot → scende verso l'uscita dell'ugello
+
+        gamma_gas, mw_gas, k_gas: proprietà gas di combustione passate dal motore.
         """
         n = len(self.x)
         i_throat = int(np.argmin(self.A))   # indice della gola (area minima)
@@ -155,13 +160,37 @@ class SpacialNozzleModel:
         mdot_up   = mdot_coolant * frac_chamber          # flusso verso camera
         mdot_down = mdot_coolant * (1.0 - frac_chamber)  # flusso verso uscita
 
+        # ── Proprietà gas lato hot ──────────────────────────────────────────────
+        R_gas = 8314.0 / max(mw_gas, 1.0)
+        cp_g  = (gamma_gas / (gamma_gas - 1.0)) * R_gas
+        Pr_g  = 0.7  # approssimazione per gas di combustione
+        mu_g  = 1.2e-4
+
         if P_c_pa < 105000:
             h_g   = np.full_like(self.x, 10.0)
+            T_aw  = np.full_like(self.x, 300.0)
             T_gas = np.full_like(self.x, 300.0)
         else:
+            # Temperatura adiabatica di parete (con fattore di recupero r = Pr^1/3)
+            r_rec = Pr_g ** (1.0 / 3.0)
             T_gas = T_c / self.temp_ratio
-            h_g   = (0.026 / self.D_throat**0.2) * ((self.mu**0.2 * self.cp_gas) / self.Pr**0.6) \
-                    * (P_c_pa / c_star)**0.8 * (self.A_throat / self.A)**0.9
+            T_aw = T_gas * (1.0 + r_rec * 0.5 * (gamma_gas - 1.0) * self.M**2)
+
+            # Bartz correlation corretta:
+            # h_g = (k/D_t) · 0.0277 · (D_t · G / μ)^0.8 · Pr^0.4 · (T_aw/T_w)^0.35
+            # G = mdot/A = P_c/c* · (A_t/A)
+            G_throat = P_c_pa / max(c_star, 1.0)
+            G_local  = G_throat * (self.A_throat / np.maximum(self.A, 1e-9))
+
+            h_g = (k_gas / max(self.D_throat, 1e-6)) * 0.0277 \
+                  * (max(self.D_throat, 1e-6) * G_local / max(mu_g, 1e-12))**0.8 \
+                  * Pr_g**0.4 \
+                  * (self.A_throat / np.maximum(self.A, 1e-9))**0.9
+
+        # Stima T_wall per il fattore (T_aw/T_w)^0.35 nella correzione Bartz
+        T_wall_est = np.clip(self.T_hw_rad[:, 0], 300.0, 1200.0)
+        T_ratio_correction = (T_aw / np.maximum(T_wall_est, 300.0))**0.35
+        h_g = h_g * T_ratio_correction
 
         # Coefficienti convettivi calcolati per ciascun semi-flusso
         h_up   = self._h_cool_nusselt(mdot_up,   coolant_pressure_bar)

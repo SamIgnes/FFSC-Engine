@@ -6,7 +6,7 @@ from core.avionics import ProportionalValve
 from core.subsystems import Turbopump, CoolingJacket, CombustionChamber
 from core.nozzle import SpacialNozzleModel
 from config import (
-    K_HEAD,
+    K_HEAD_OX, K_HEAD_F,
     RHO_LOX, RHO_LCH4_NOM,
     TANK_P_INIT_BAR, TANK_T_OX_INIT, TANK_T_F_INIT, TANK_H_OX_M, TANK_H_F_M,
     TP_OX_INERTIA, TP_OX_PUMP_K1, TP_OX_PUMP_K2, TP_OX_NPSH,
@@ -119,6 +119,8 @@ class FFSCC_Engine:
         self.dp_inj_f_orhc_bar  = 0.0   # CH4 bleed → ORHC
         self.p_man_ox_bar       = 0.0   # pressione manifold LOX (lato liquido, prima iniettori ORHC)
         self.p_man_f_bar        = 0.0   # pressione manifold CH4 (lato liquido, prima iniettori FRHC)
+        self.p_dh_ox_bar        = 0.0   # pressione uscita pompa LOX [bar]
+        self.p_dh_f_bar         = 0.0   # pressione uscita pompa CH4 [bar]
         self.t_tank_f  = TANK_T_F_INIT
         self.t_tank_ox = TANK_T_OX_INIT
         self.h_tank_ox_m = TANK_H_OX_M
@@ -136,9 +138,9 @@ class FFSCC_Engine:
     @property
     def coolant_pressure_bar(self) -> float:
         w_f       = float(self.state[2])
-        p_tank_f  = float(self.state[8])
+        p_tank_f  = float(self.state[9])
         p_inlet_f = p_tank_f + ((RHO_LCH4_NOM * 9.81 * TANK_H_F_M) / 100000.0)
-        return p_inlet_f + K_HEAD * (w_f**2)
+        return p_inlet_f + K_HEAD_F * (w_f**2)
 
     def system_equations(self, _t, y):
         (P_mcc, w_ox, w_f, th_mov, th_mfv, v_orhc, v_frhc,
@@ -160,8 +162,8 @@ class FFSCC_Engine:
         p_inlet_ox = P_tank_ox + (rho_ox * 9.81 * self.g_force * self.h_tank_ox_m) / 1e5
         p_inlet_f  = P_tank_f  + (rho_f  * 9.81 * self.g_force * self.h_tank_f_m)  / 1e5
 
-        P_dh_ox = p_inlet_ox + K_HEAD * (w_ox**2)
-        P_dh_f  = p_inlet_f  + K_HEAD * (w_f**2)
+        P_dh_ox = p_inlet_ox + K_HEAD_OX * (w_ox**2)
+        P_dh_f  = p_inlet_f  + K_HEAD_F  * (w_f**2)
 
         R_valve_ox = R_VALVE_OX_K / (max(0.0, th_mov)**3 + 1e-6)
         R_valve_f  = R_VALVE_F_K  / (max(0.0, th_mfv)**3 + 1e-6)
@@ -204,43 +206,61 @@ class FFSCC_Engine:
         # ── Blocco 4: Termodinamica pre-burner, iniettori, turbine ───────────
         of_orhc = ox_in_orhc / max(f_in_orhc, 1e-9)
         of_frhc = ox_in_frhc / max(f_in_frhc, 1e-9)
-        # ORHC: LOX non passa dal jacket → T_fuel_ref (default)
+        # ORHC: LOX non passa dal jacket → T_fuel_ref (default ~112K)
         # FRHC: CH4 entra dal jacket a T_cool → passa temperatura reale
-        t_orhc = CEA_MethaloxCombustion.get_t_ad(of_orhc, P_orhc_bar) if self.is_ignited else 300.0
+        t_orhc = CEA_MethaloxCombustion.get_t_ad(of_orhc, P_orhc_bar, t_fuel=self.t_tank_f) if self.is_ignited else 300.0
         t_frhc = CEA_MethaloxCombustion.get_t_ad(of_frhc, P_frhc_bar, t_fuel=T_cool) if self.is_ignited else 300.0
 
-        gamma_o  = CEA_MethaloxCombustion.get_gamma(of_orhc)
+        gamma_o  = CEA_MethaloxCombustion.get_gamma(of_orhc, t_fuel=self.t_tank_f)
         gamma_f  = CEA_MethaloxCombustion.get_gamma(of_frhc, t_fuel=T_cool)
-        mw_o     = CEA_MethaloxCombustion.get_mw(of_orhc)
+        mw_o     = CEA_MethaloxCombustion.get_mw(of_orhc, t_fuel=self.t_tank_f)
         mw_f     = CEA_MethaloxCombustion.get_mw(of_frhc, t_fuel=T_cool)
         cp_gas_o = (gamma_o / (gamma_o - 1.0)) * (8314.0 / mw_o)
         cp_gas_f = (gamma_f / (gamma_f - 1.0)) * (8314.0 / mw_f)
 
-        p_back_ox_pa = max(P_orhc * P_BACK_FACTOR, P_mcc)
-        p_back_f_pa  = max(P_frhc * P_BACK_FACTOR, P_mcc)
-        mdot_out_orhc = self.orhc_chamber.get_exhaust_mass_flow(P_orhc, self.is_ignited, cs_eff_orhc,
-                                                                  p_back_pa=p_back_ox_pa)
-        mdot_out_frhc = self.frhc_chamber.get_exhaust_mass_flow(P_frhc, self.is_ignited, cs_eff_frhc,
-                                                                  p_back_pa=p_back_f_pa)
-
-        # ── Iniettori MCC: Bernoulli (gas ideale, densità da P/RT) ──────────
-        A_inj_ox = A_INJ_GAS_OX; A_inj_f = A_INJ_GAS_F; Cd_inj = CD_INJ_GAS
+        # ── Iniettori MCC: stima iniziale P_man (usata come back-pressure per mdot_out) ──
+        # Densità gas dai preburner (Bernoulli)
         R_gas_o  = 8314.0 / max(mw_o, 1.0)
         R_gas_f  = 8314.0 / max(mw_f, 1.0)
         rho_gas_o = P_orhc / (R_gas_o * max(t_orhc, 300.0))
         rho_gas_f = P_frhc / (R_gas_f * max(t_frhc, 300.0))
+
+        # Stima mdot_out con back-pressure approssimata (P_BACK_FACTOR) per rompere la circolarità:
+        #   P_preburner → nozzle → turbina (ΔP) → P_man → iniettori (ΔP) → P_mcc
+        # mdot_out dipende da P_man (choked o meno), ma P_man dipende da mdot_out (ΔP iniettore).
+        # Primo passo: stima mdot_out con back ≈ P_mcc (worst case per smoothing).
+        p_back_init_ox = max(P_orhc * P_BACK_FACTOR, P_mcc)
+        p_back_init_f  = max(P_frhc * P_BACK_FACTOR, P_mcc)
+        mdot_out_orhc = self.orhc_chamber.get_exhaust_mass_flow(P_orhc, self.is_ignited, cs_eff_orhc,
+                                                                  p_back_pa=p_back_init_ox)
+        mdot_out_frhc = self.frhc_chamber.get_exhaust_mass_flow(P_frhc, self.is_ignited, cs_eff_frhc,
+                                                                  p_back_pa=p_back_init_f)
+
+        # Calcola P_man dal ΔP iniettori
+        A_inj_ox = A_INJ_GAS_OX; A_inj_f = A_INJ_GAS_F; Cd_inj = CD_INJ_GAS
         dP_inj_ox_pa = (mdot_out_orhc / max(Cd_inj * A_inj_ox, 1e-9))**2 / (2.0 * max(rho_gas_o, 0.1))
         dP_inj_f_pa  = (mdot_out_frhc / max(Cd_inj * A_inj_f,  1e-9))**2 / (2.0 * max(rho_gas_f, 0.1))
-        P_man_ox_bar = max(P_orhc_bar - dP_inj_ox_pa / 1e5, P_mcc / 1e5)
-        P_man_f_bar  = max(P_frhc_bar - dP_inj_f_pa  / 1e5, P_mcc / 1e5)
+        P_man_ox_bar = P_mcc / 1e5 + dP_inj_ox_pa / 1e5
+        P_man_f_bar  = P_mcc / 1e5 + dP_inj_f_pa  / 1e5
+
+        # Secondo passo: ricalcola mdot_out con la P_man effettiva come back-pressure.
+        # Questo assicura coerenza tra mdot_out (usato per coppia turbina) e
+        # il back-pressure usato nel derivative della pressione preburner.
+        p_back_ox_final = P_man_ox_bar * 1e5
+        p_back_f_final  = P_man_f_bar  * 1e5
+        mdot_out_orhc = self.orhc_chamber.get_exhaust_mass_flow(P_orhc, self.is_ignited, cs_eff_orhc,
+                                                                  p_back_pa=p_back_ox_final)
+        mdot_out_frhc = self.frhc_chamber.get_exhaust_mass_flow(P_frhc, self.is_ignited, cs_eff_frhc,
+                                                                  p_back_pa=p_back_f_final)
 
         dP_orhc_dt = self.orhc_chamber.get_derivative(P_orhc, ox_in_orhc, f_in_orhc,
-                                                       self.is_ignited, p_back_pa=P_man_ox_bar * 1e5)
+                                                       self.is_ignited, p_back_pa=p_back_ox_final)
         dP_frhc_dt = self.frhc_chamber.get_derivative(P_frhc, ox_in_frhc, f_in_frhc,
-                                                       self.is_ignited, p_back_pa=P_man_f_bar * 1e5)
+                                                       self.is_ignited, p_back_pa=p_back_f_final)
 
         starter_ox = (th_mov * STARTER_TORQUE) * np.exp(-P_orhc_bar / STARTER_TAU_BAR)
         starter_f  = (th_mfv * STARTER_TORQUE) * np.exp(-P_frhc_bar / STARTER_TAU_BAR)
+
 
         dw_ox_dt = self.tp_ox.get_derivative(
             w_ox, P_orhc_bar, P_orhc_bar, P_man_ox_bar,
@@ -258,7 +278,7 @@ class FFSCC_Engine:
 
         dT_cool_dt = self.jacket.get_derivative(T_cool, P_mcc, mdot_f_tot, self.is_ignited, 300.0, 0.5, coolant_p_bar=P_dh_f)
         # OF in MCC = composizione elementare reale (mdot_ox_tot/mdot_f_tot), non rapporto scarichi pre-burner
-        dP_dt      = self.mcc.get_derivative(P_mcc, mdot_ox_tot, mdot_f_tot, self.is_ignited)
+        dP_dt      = self.mcc.get_derivative(P_mcc, mdot_ox_tot, mdot_f_tot, self.is_ignited, t_fuel=T_cool)
 
         return np.array([dP_dt, dw_ox_dt, dw_f_dt, dth_mov_dt, dth_mfv_dt,
                          dv_orhc_dt, dv_frhc_dt, dT_cool_dt, dP_tank_ox_dt, dP_tank_f_dt,
@@ -278,8 +298,8 @@ class FFSCC_Engine:
         p_inlet_ox = P_tank_ox + (rho_ox * 9.81 * self.g_force * self.h_tank_ox_m) / 1e5
         p_inlet_f  = P_tank_f  + (rho_f  * 9.81 * self.g_force * self.h_tank_f_m)  / 1e5
 
-        P_dh_ox = p_inlet_ox + K_HEAD * (w_ox**2)
-        P_dh_f  = p_inlet_f  + K_HEAD * (w_f**2)
+        P_dh_ox = p_inlet_ox + K_HEAD_OX * (w_ox**2)
+        P_dh_f  = p_inlet_f  + K_HEAD_F  * (w_f**2)
 
         R_valve_ox = R_VALVE_OX_K / (max(0.0, th_mov)**3 + 1e-6)
         R_valve_f  = R_VALVE_F_K  / (max(0.0, th_mfv)**3 + 1e-6)
@@ -313,7 +333,7 @@ class FFSCC_Engine:
         of_orhc = ox_in_orhc / max(f_in_orhc, 1e-9)
         of_frhc = ox_in_frhc / max(f_in_frhc, 1e-9)
 
-        t_orhc = CEA_MethaloxCombustion.get_t_ad(of_orhc, P_orhc_bar) if self.is_ignited else 300.0
+        t_orhc = CEA_MethaloxCombustion.get_t_ad(of_orhc, P_orhc_bar, t_fuel=self.t_tank_f) if self.is_ignited else 300.0
         t_frhc = CEA_MethaloxCombustion.get_t_ad(of_frhc, P_frhc_bar, t_fuel=T_cool) if self.is_ignited else 300.0
 
         cs_eff_orhc = self.orhc_chamber.get_c_star_eff(ox_in_orhc, f_in_orhc, P_orhc)
@@ -326,7 +346,7 @@ class FFSCC_Engine:
         mdot_out_frhc = self.frhc_chamber.get_exhaust_mass_flow(P_frhc, self.is_ignited, cs_eff_frhc,
                                                                   p_back_pa=p_back_f_pa)
 
-        mw_o    = CEA_MethaloxCombustion.get_mw(of_orhc)
+        mw_o    = CEA_MethaloxCombustion.get_mw(of_orhc, t_fuel=self.t_tank_f)
         mw_f    = CEA_MethaloxCombustion.get_mw(of_frhc, t_fuel=T_cool)
         R_gas_o = 8314.0 / max(mw_o, 1.0)
         R_gas_f = 8314.0 / max(mw_f, 1.0)
@@ -336,8 +356,16 @@ class FFSCC_Engine:
         rho_gas_f = P_frhc / (R_gas_f * max(t_frhc, 300.0))
         dP_inj_ox_pa = (mdot_out_orhc / max(Cd_inj * A_inj_ox, 1e-9))**2 / (2.0 * max(rho_gas_o, 0.1))
         dP_inj_f_pa  = (mdot_out_frhc / max(Cd_inj * A_inj_f,  1e-9))**2 / (2.0 * max(rho_gas_f, 0.1))
-        P_man_ox_bar = max(P_orhc_bar - dP_inj_ox_pa / 1e5, P_mcc / 1e5)
-        P_man_f_bar  = max(P_frhc_bar - dP_inj_f_pa  / 1e5, P_mcc / 1e5)
+        P_man_ox_bar = P_mcc / 1e5 + dP_inj_ox_pa / 1e5
+        P_man_f_bar  = P_mcc / 1e5 + dP_inj_f_pa  / 1e5
+
+        # Ricalcola mdot_out con back-pressure P_man per coerenza
+        p_back_ox_final = P_man_ox_bar * 1e5
+        p_back_f_final  = P_man_f_bar  * 1e5
+        mdot_out_orhc = self.orhc_chamber.get_exhaust_mass_flow(P_orhc, self.is_ignited, cs_eff_orhc,
+                                                                  p_back_pa=p_back_ox_final)
+        mdot_out_frhc = self.frhc_chamber.get_exhaust_mass_flow(P_frhc, self.is_ignited, cs_eff_frhc,
+                                                                  p_back_pa=p_back_f_final)
 
         self.of_orhc_current    = of_orhc
         self.of_frhc_current    = of_frhc
@@ -355,13 +383,15 @@ class FFSCC_Engine:
         self.dp_inj_f_orhc_bar  = R_inj_f_orhc  * f_in_orhc**2
         self.p_man_ox_bar       = P_man_ox
         self.p_man_f_bar        = P_man_f
+        self.p_dh_ox_bar        = P_dh_ox
+        self.p_dh_f_bar         = P_dh_f
 
     def step(self, dt):
         t0 = self.current_time
         t1 = t0 + dt
         sol = solve_ivp(
             self.system_equations, [t0, t1], self.state,
-            method='BDF', rtol=1e-3, atol=1e-4, max_step=dt
+            method='BDF', rtol=1e-2, atol=1e-3, max_step=dt
         )
         if sol.success:
             self.state = sol.y[:, -1]
@@ -404,9 +434,14 @@ class FFSCC_Engine:
         mdot_f   = max(self.mdot_f_last, 0.1)
         of_mcc   = self.mdot_ox_last / max(mdot_f, 0.01)
         P_bar    = P_mcc_pa / 1e5
+        T_cool   = float(self.state[7])
 
-        T_c    = CEA_MethaloxCombustion.get_t_ad(of_mcc, P_bar)
-        c_star = CEA_MethaloxCombustion.get_c_star(of_mcc, P_bar) * self.mcc.eta_cstar
+        T_c    = CEA_MethaloxCombustion.get_t_ad(of_mcc, P_bar, t_fuel=T_cool)
+        c_star = CEA_MethaloxCombustion.get_c_star(of_mcc, P_bar, t_fuel=T_cool) * self.mcc.eta_cstar
+        gamma_mcc = CEA_MethaloxCombustion.get_gamma(of_mcc, t_fuel=T_cool)
+        mw_mcc    = CEA_MethaloxCombustion.get_mw(of_mcc, t_fuel=T_cool)
+        # Stima conducibilità termica gas: k ≈ 0.15 W/m/K per gas di combustione CH4/LOX
+        k_mcc  = 0.15
 
         # Usa mdot nominale jacket: la geometria dei canali è calibrata su JACKET_MDOT_NOM.
         # Il flusso reale (mdot_f_last) è proporzionalmente più alto ma la distribuzione
@@ -417,6 +452,7 @@ class FFSCC_Engine:
             P_mcc_pa, T_c, c_star, mdot_jacket,
             T_inlet=self.t_tank_f, dt=dt,
             coolant_pressure_bar=self.coolant_pressure_bar,
+            gamma_gas=gamma_mcc, mw_gas=mw_mcc, k_gas=k_mcc,
         )
 
         # NON sovrascrivere state[7]: T_cool è gestita dall'ODE via CoolingJacket 0D.

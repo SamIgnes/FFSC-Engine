@@ -240,7 +240,7 @@ class CEA_MethaloxCombustion:
         return t_ad, cstar, gamma, mw
 
     @classmethod
-    def _extrapolate_high_of(cls, of_ratio):
+    def _extrapolate_high_of(cls, of_ratio, t_fuel_k=None):
         """
         Estrapolazione analitica per OF > 50 (regime ox-rich estremo).
 
@@ -312,7 +312,7 @@ class CEA_MethaloxCombustion:
 
         # Estrapolazione analitica fuori dal range CEA
         if float(of_ratio) > cls._OF_MAX:
-            t_ad, _, _, _ = cls._extrapolate_high_of(of_ratio)
+            t_ad, _, _, _ = cls._extrapolate_high_of(of_ratio, t_fuel_k)
             return t_ad * p_corr
         if float(of_ratio) < cls._OF_MIN:
             t_ad, _, _, _ = cls._extrapolate_low_of(of_ratio, t_fuel_k)
@@ -341,7 +341,7 @@ class CEA_MethaloxCombustion:
 
         # Estrapolazione analitica fuori dal range CEA
         if float(of_ratio) > cls._OF_MAX:
-            _, cstar, _, _ = cls._extrapolate_high_of(of_ratio)
+            _, cstar, _, _ = cls._extrapolate_high_of(of_ratio, t_fuel_k)
             return cstar * p_corr
         if float(of_ratio) < cls._OF_MIN:
             _, cstar, _, _ = cls._extrapolate_low_of(of_ratio, t_fuel_k)
@@ -356,15 +356,15 @@ class CEA_MethaloxCombustion:
     @classmethod
     def get_gamma(cls, of_ratio, t_fuel=None):
         """Rapporto dei calori specifici gamma [-]."""
+        t_fuel_k = float(t_fuel) if t_fuel is not None else cls._T_FUEL_REF
         # Estrapolazione analitica fuori dal range CEA
         if float(of_ratio) > cls._OF_MAX:
-            _, _, gamma, _ = cls._extrapolate_high_of(of_ratio)
+            _, _, gamma, _ = cls._extrapolate_high_of(of_ratio, t_fuel_k)
             return gamma
         if float(of_ratio) < cls._OF_MIN:
-            _, _, gamma, _ = cls._extrapolate_low_of(of_ratio)
+            _, _, gamma, _ = cls._extrapolate_low_of(of_ratio, t_fuel_k)
             return gamma
 
-        t_fuel_k = float(t_fuel) if t_fuel is not None else cls._T_FUEL_REF
         v3d = cls._query_3d('gamma', of_ratio, t_fuel_k)
         if v3d is not None:
             return v3d
@@ -373,15 +373,15 @@ class CEA_MethaloxCombustion:
     @classmethod
     def get_mw(cls, of_ratio, t_fuel=None):
         """Massa molecolare media dei prodotti di combustione [g/mol]."""
+        t_fuel_k = float(t_fuel) if t_fuel is not None else cls._T_FUEL_REF
         # Estrapolazione analitica fuori dal range CEA
         if float(of_ratio) > cls._OF_MAX:
-            _, _, _, mw = cls._extrapolate_high_of(of_ratio)
+            _, _, _, mw = cls._extrapolate_high_of(of_ratio, t_fuel_k)
             return mw
         if float(of_ratio) < cls._OF_MIN:
-            _, _, _, mw = cls._extrapolate_low_of(of_ratio)
+            _, _, _, mw = cls._extrapolate_low_of(of_ratio, t_fuel_k)
             return mw
 
-        t_fuel_k = float(t_fuel) if t_fuel is not None else cls._T_FUEL_REF
         v3d = cls._query_3d('mw', of_ratio, t_fuel_k)
         if v3d is not None:
             return v3d

@@ -1,9 +1,20 @@
 """
-gui.py
+gui/app.py
 GUI Tkinter + aggiornamento live della simulazione FFSCC.
+
+Architettura threading:
+  - SimThread  : gira su un core dedicato; esegue fc.update + engine.step a 20 Hz
+                 (dt = 0.05 s) e deposita snapshot immutabili in una queue.Queue.
+  - GUI Thread : root.after drena la coda, aggiorna label/plot senza mai toccare
+                 direttamente l'engine — zero lag sul mainloop Tkinter.
+
 Layout: colonna sinistra = sidebar telemetria/controlli
         colonna destra  = 5 pannelli temporali (sinistra) + schema motore (destra)
 """
+import threading
+import queue
+import time
+import types
 import tkinter as tk
 import numpy as np
 from matplotlib.figure import Figure
@@ -13,7 +24,7 @@ import matplotlib.patches as mpatches
 from core.thermodynamics import CH4RealGasProps, CEA_MethaloxCombustion
 from core.engine import FFSCC_Engine
 from core.avionics import FlightComputer
-from config import K_HEAD
+from config import K_HEAD_OX, K_HEAD_F
 from core.structures import StructuralAnalyzer
 
 # ── Palette colori ─────────────────────────────────────────────────────────────
@@ -90,7 +101,7 @@ class AppGUI:
         self.engine = FFSCC_Engine()
         self.dt     = 0.05
         self.fc     = FlightComputer(dt=self.dt)
-        self.target_thrust = 2750.0
+        self.target_thrust = 2750.0  # scritto dalla GUI, letto dal sim thread (GIL-safe per float)
 
         self.max_len = 400
         self.hist = {k: [0.0] * self.max_len for k in [
@@ -102,9 +113,10 @@ class AppGUI:
             'mdot_ox', 'mdot_f',
         ]}
 
-        # spatial_nozzle è ora di proprietà dell'engine (operator splitting)
         self.struct_analyzer = StructuralAnalyzer()
         self._right_panel   = "SCHEMA"   # "SCHEMA" | "NOZZLE" | "STRUCT"
+        self._frame_count   = 0
+        self._last_snap     = None       # ultimo snapshot ricevuto dalla queue
 
         self._build_sidebar(root)
 
@@ -112,8 +124,179 @@ class AppGUI:
         plot_frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
 
         self._build_figure(plot_frame)
-        self._rebuild_nozzle_artists()   # inizializza linee (poi subito sovrascritte da schema al boot)
-        self.root.after(50, self._update_sim)
+        self._rebuild_nozzle_artists()
+
+        # ── Coda di comunicazione sim → GUI ───────────────────────────────────
+        # maxsize=60 ≈ 3 s di backlog; se la GUI è troppo lenta i frame più vecchi
+        # vengono scartati nel sim thread per evitare memory leak.
+        self._sim_queue = queue.Queue(maxsize=60)
+        self._running   = True
+
+        self._sim_thread = threading.Thread(
+            target=self._sim_loop,
+            name="SimThread",
+            daemon=True,   # si chiude automaticamente con il processo
+        )
+        self._sim_thread.start()
+
+        # Pulizia alla chiusura della finestra
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+
+        # Avvia il loop GUI
+        self.root.after(16, self._update_gui)   # ~60 fps di polling
+
+    # ── Lifecycle ─────────────────────────────────────────────────────────────
+    def _on_close(self):
+        self._running = False
+        self.root.destroy()
+
+    # ── Sim thread ────────────────────────────────────────────────────────────
+    def _sim_loop(self):
+        """Gira sul thread dedicato: calcola un passo ODE e deposita uno snapshot."""
+        dt = self.dt
+        while self._running:
+            t_wall_start = time.perf_counter()
+
+            # Leggi stato corrente dell'engine
+            curr_thrust = self.engine.get_current_thrust()
+            st          = self.engine.state.copy()
+
+            telemetry = (
+                st[0] / 1e5, st[1], st[2], st[7],
+                self.engine.of_orhc_current, self.engine.of_frhc_current,
+                st[8], st[9],
+                self.engine.mdot_ox_last, self.engine.mdot_f_last,
+                self.engine.p_dh_ox_bar, self.engine.p_dh_f_bar,
+                st[12] / 1e5, st[13] / 1e5,
+            )
+            cav_status = (
+                self.engine.tp_ox.is_cavitating,
+                self.engine.tp_fuel.is_cavitating,
+            )
+
+            # Controllo avionico (PI + state machine)
+            th_mov, th_mfv, v_orhc, v_frhc, v_auto_ox, v_auto_f, is_ignited, state_str = \
+                self.fc.update(self.target_thrust, curr_thrust, telemetry, cav_status)
+
+            # Applica comandi all'engine
+            self.engine.cmd_th_mov    = th_mov
+            self.engine.cmd_th_mfv    = th_mfv
+            self.engine.cmd_v_orhc    = v_orhc
+            self.engine.cmd_v_frhc    = v_frhc
+            self.engine.cmd_v_auto_ox = v_auto_ox
+            self.engine.cmd_v_auto_f  = v_auto_f
+            self.engine.is_ignited    = is_ignited
+
+            # Avanza ODE (pesante: BDF + Jacobiani)
+            self.engine.step(dt)
+
+            # Costruisci snapshot immutabile (copie NumPy per i vettori)
+            sn   = self.engine.spatial_nozzle
+            snap = {
+                # ── vettore di stato ──────────────────────────────────────────
+                'st'            : st,
+                'curr_thrust'   : curr_thrust,
+                'state_str'     : state_str,
+                'abort_reason'  : self.fc.abort_reason,
+                'current_time'  : self.engine.current_time,
+                # ── campi scalari engine ──────────────────────────────────────
+                'of_orhc_current'   : self.engine.of_orhc_current,
+                'of_frhc_current'   : self.engine.of_frhc_current,
+                't_orhc_current'    : self.engine.t_orhc_current,
+                't_frhc_current'    : self.engine.t_frhc_current,
+                'mdot_ox_last'      : self.engine.mdot_ox_last,
+                'mdot_f_last'       : self.engine.mdot_f_last,
+                'p_dh_ox_bar'       : self.engine.p_dh_ox_bar,
+                'p_dh_f_bar'        : self.engine.p_dh_f_bar,
+                'coolant_pressure_bar': self.engine.coolant_pressure_bar,
+                'is_ignited'        : self.engine.is_ignited,
+                't_tank_ox'         : self.engine.t_tank_ox,
+                't_tank_f'          : self.engine.t_tank_f,
+                'g_force'           : self.engine.g_force,
+                'h_tank_ox_m'       : self.engine.h_tank_ox_m,
+                'h_tank_f_m'        : self.engine.h_tank_f_m,
+                'dp_inj_ox_bar'     : self.engine.dp_inj_ox_bar,
+                'dp_inj_f_bar'      : self.engine.dp_inj_f_bar,
+                'dp_inj_ox_orhc_bar': getattr(self.engine, 'dp_inj_ox_orhc_bar', 0.0),
+                'dp_inj_f_frhc_bar' : getattr(self.engine, 'dp_inj_f_frhc_bar',  0.0),
+                'p_man_ox_bar'      : getattr(self.engine, 'p_man_ox_bar', 0.0),
+                'p_man_f_bar'       : getattr(self.engine, 'p_man_f_bar',  0.0),
+                # ── snapshot ugello (copie per thread-safety) ─────────────────
+                'sn_x'           : sn.x.copy(),
+                'sn_T_hw_rad'    : sn.T_hw_rad.copy(),
+                'sn_T_cool'      : sn.T_cool.copy(),
+                'sn_T_cw'        : sn.T_cw.copy(),
+                'sn_temp_ratio'  : sn.temp_ratio.copy(),
+                'sn_A'           : sn.A.copy(),
+                'sn_M'           : sn.M.copy(),
+                'sn_r'           : sn.r.copy(),
+                'sn_t_hw_profile': sn.t_hw_profile.copy(),
+                'sn_t_cw_scalar' : float(sn.t_cw),
+            }
+
+            # Deposita nella queue; se piena scarta il frame più vecchio
+            try:
+                self._sim_queue.put_nowait(snap)
+            except queue.Full:
+                try:
+                    self._sim_queue.get_nowait()
+                except queue.Empty:
+                    pass
+                try:
+                    self._sim_queue.put_nowait(snap)
+                except queue.Full:
+                    pass
+
+            # Rispetta il passo temporale reale (dt = 0.05 s)
+            elapsed    = time.perf_counter() - t_wall_start
+            sleep_time = dt - elapsed
+            if sleep_time > 0.0:
+                time.sleep(sleep_time)
+
+    # ── Helper: engine proxy da snapshot ──────────────────────────────────────
+    @staticmethod
+    def _make_engine_proxy(snap):
+        """Costruisce un SimpleNamespace che imita i campi engine usati dal rendering."""
+        sn_proxy = types.SimpleNamespace(
+            x           = snap['sn_x'],
+            T_hw_rad    = snap['sn_T_hw_rad'],
+            T_cool      = snap['sn_T_cool'],
+            T_cw        = snap['sn_T_cw'],
+            temp_ratio  = snap['sn_temp_ratio'],
+            A           = snap['sn_A'],
+            M           = snap['sn_M'],
+            r           = snap['sn_r'],
+            t_hw_profile= snap['sn_t_hw_profile'],
+            t_cw        = snap['sn_t_cw_scalar'],
+        )
+        proxy = types.SimpleNamespace(
+            state               = snap['st'],
+            of_orhc_current     = snap['of_orhc_current'],
+            of_frhc_current     = snap['of_frhc_current'],
+            t_orhc_current      = snap['t_orhc_current'],
+            t_frhc_current      = snap['t_frhc_current'],
+            mdot_ox_last        = snap['mdot_ox_last'],
+            mdot_f_last         = snap['mdot_f_last'],
+            p_dh_ox_bar         = snap['p_dh_ox_bar'],
+            p_dh_f_bar          = snap['p_dh_f_bar'],
+            coolant_pressure_bar= snap['coolant_pressure_bar'],
+            is_ignited          = snap['is_ignited'],
+            t_tank_ox           = snap['t_tank_ox'],
+            t_tank_f            = snap['t_tank_f'],
+            g_force             = snap['g_force'],
+            h_tank_ox_m         = snap['h_tank_ox_m'],
+            h_tank_f_m          = snap['h_tank_f_m'],
+            dp_inj_ox_bar       = snap['dp_inj_ox_bar'],
+            dp_inj_f_bar        = snap['dp_inj_f_bar'],
+            dp_inj_ox_orhc_bar  = snap['dp_inj_ox_orhc_bar'],
+            dp_inj_f_frhc_bar   = snap['dp_inj_f_frhc_bar'],
+            p_man_ox_bar        = snap['p_man_ox_bar'],
+            p_man_f_bar         = snap['p_man_f_bar'],
+            spatial_nozzle      = sn_proxy,
+        )
+        # get_current_thrust() usato nello schema
+        proxy.get_current_thrust = lambda: snap['curr_thrust']
+        return proxy
 
     # ── Sidebar ───────────────────────────────────────────────────────────────
     def _build_sidebar(self, root):
@@ -248,7 +431,7 @@ class AppGUI:
         self._btn_schema.config(bg="#4a4a4a")
         self._btn_nozzle.config(bg="#16a085")
         self._btn_struct.config(bg="#4a4a4a")
-        self._rebuild_nozzle_artists()   # ricostruisce dopo eventuale ax.clear() dello schema
+        self._rebuild_nozzle_artists()
 
     def _show_struct(self):
         self._right_panel = "STRUCT"
@@ -272,7 +455,7 @@ class AppGUI:
         self.ax_w     = self.fig.add_subplot(gs[2, :2])
         self.ax_tank  = self.fig.add_subplot(gs[3, :2])
         self.ax_v     = self.fig.add_subplot(gs[4, :2])
-        self.ax_schema = self.fig.add_subplot(gs[:, 2])   # schema motore
+        self.ax_schema = self.fig.add_subplot(gs[:, 2])
 
         # Panel 0: Spinta e P_MCC
         self.ax_pmcc = self.ax_t.twinx()
@@ -330,11 +513,8 @@ class AppGUI:
         self.ax_mdot.legend(loc="upper right", fontsize=9, facecolor=BG_AX, labelcolor=COL_TEXT, framealpha=0.8)
         self.ax_v.set_xlabel("Tempo (s)", fontsize=8, color=COL_TEXT)
 
-        # Schema motore (colonna destra, riempie tutto)
         self.ax_schema.set_facecolor(BG_FIG)
         self.ax_schema.axis('off')
-
-        # Linee nozzle create da _rebuild_nozzle_artists (chiamata dopo)
         self.l_gas = self.l_hw_hot = self.l_hw_cold = self.l_cool = self.l_cw = None
 
         self.canvas = FigureCanvasTkAgg(self.fig, master=plot_frame)
@@ -345,12 +525,11 @@ class AppGUI:
     def _draw_schema(self, st, engine, state_str):
         ax = self.ax_schema
         ax.clear()
-        ax.set_facecolor('#e8edf2')   # sfondo chiaro per testo nero leggibile
+        ax.set_facecolor('#e8edf2')
         ax.set_xlim(0, 8)
         ax.set_ylim(0, 16)
         ax.axis('off')
 
-        # ── Valori correnti ───────────────────────────────────────────────────
         p_mcc      = st[0] / 1e5
         w_ox       = st[1]
         w_f        = st[2]
@@ -368,27 +547,23 @@ class AppGUI:
         of_mcc     = mdot_ox / max(mdot_f, 0.01)
         curr_thrust = engine.get_current_thrust()
 
-        # Pressioni pompe (da formula engine.py)
         rho_ox = 1141.0
         rho_f  = CH4RealGasProps.density(engine.t_tank_f, p_tank_f)
         p_in_ox = p_tank_ox + (rho_ox * 9.81 * engine.g_force * engine.h_tank_ox_m) / 1e5
         p_in_f  = p_tank_f  + (rho_f  * 9.81 * engine.g_force * engine.h_tank_f_m)  / 1e5
-        p_dh_ox = p_in_ox + K_HEAD * w_ox**2   # testa pompa LOX [bar]
-        p_dh_f  = p_in_f  + K_HEAD * w_f**2    # testa pompa CH4 [bar]
+        p_dh_ox = p_in_ox + K_HEAD_OX * w_ox**2
+        p_dh_f  = p_in_f  + K_HEAD_F  * w_f**2
 
-        # Salto di pressione iniettori MCC (calcolato nell'engine)
         dp_inj_ox = engine.dp_inj_ox_bar
         dp_inj_f  = engine.dp_inj_f_bar
         p_man_ox  = p_mcc + dp_inj_ox
         p_man_f   = p_mcc + dp_inj_f
 
-        # Salto di pressione iniettori pre-burner (calcolato nell'engine)
-        dp_inj_ox_orhc = getattr(engine, 'dp_inj_ox_orhc_bar', 0.0)
-        dp_inj_f_frhc  = getattr(engine, 'dp_inj_f_frhc_bar',  0.0)
-        p_man_ox_pb    = getattr(engine, 'p_man_ox_bar', p_dh_ox)
-        p_man_f_pb     = getattr(engine, 'p_man_f_bar',  p_dh_f)
+        dp_inj_ox_orhc = engine.dp_inj_ox_orhc_bar
+        dp_inj_f_frhc  = engine.dp_inj_f_frhc_bar
+        p_man_ox_pb    = engine.p_man_ox_bar
+        p_man_f_pb     = engine.p_man_f_bar
 
-        # ── Helper: disegna box con colore pressione ───────────────────────────
         def box(x, y, w, h, title, lines, p_bar, edge='#4a6080'):
             fc = _pcol(p_bar, p_max=800)
             brightness = float(np.clip(p_bar / 400.0, 0.0, 1.0))
@@ -412,7 +587,6 @@ class AppGUI:
                     ha='right', va='bottom', fontsize=7.5,
                     color='#1a1a1a', zorder=4, fontweight='bold')
 
-        # ── Helper: freccia di flusso ──────────────────────────────────────────
         def arrow(x0, y0, x1, y1, color='#7f8c8d', lw=1.5, rad=0.0, lbl='', lbl_col='#2c3e50'):
             ax.annotate('', xy=(x1, y1), xytext=(x0, y0),
                         arrowprops=dict(
@@ -424,7 +598,6 @@ class AppGUI:
                 ax.text(mx + 0.15, my, lbl, ha='left', va='center',
                         fontsize=7.5, color=lbl_col, zorder=4, fontweight='bold')
 
-        # ── Helper: indicatore valvola ─────────────────────────────────────────
         def valve(cx, cy, pct, label):
             pct_c = float(np.clip(pct, 0, 100))
             r = float(np.clip(1.0 - pct_c/100, 0, 1))
@@ -440,7 +613,6 @@ class AppGUI:
                     ha='center', va='top', fontsize=8,
                     color='#1a1a1a', zorder=4, fontweight='bold')
 
-        # ── Titolo ─────────────────────────────────────────────────────────────
         ax.text(4.0, 15.65, 'PRESSURE  LADDER', ha='center', va='top',
                 fontsize=12, fontweight='bold', color='#1a1a1a')
         ax.text(1.5, 15.3, '◀  OX  SIDE', ha='center', va='top',
@@ -448,7 +620,6 @@ class AppGUI:
         ax.text(6.5, 15.3, 'FUEL  SIDE  ▶', ha='center', va='top',
                 fontsize=9, color='#007755', fontweight='bold')
 
-        # ── LOX TANK  /  LCH4 TANK ────────────────────────────────────────────
         box(0.2, 13.2, 3.0, 1.6, 'LOX  TANK',
             [f'P = {p_tank_ox:.2f} bar', f'T = {engine.t_tank_ox:.0f} K'],
             p_tank_ox)
@@ -459,7 +630,6 @@ class AppGUI:
         arrow(1.7, 13.2, 1.7, 12.15, color='#336699', lw=2.0)
         arrow(6.3, 13.2, 6.3, 12.15, color='#227755', lw=2.0)
 
-        # ── TP_OX  /  TP_FUEL ─────────────────────────────────────────────────
         box(0.2, 10.4, 3.0, 1.7, 'TURBOPOMPA  OX',
             [f'RPM  {w_ox:.0f}', f'P_pump {p_dh_ox:.0f} bar', f'P_ORHC {p_orhc:.0f} bar'],
             p_dh_ox)
@@ -467,7 +637,6 @@ class AppGUI:
             [f'RPM  {w_f:.0f}', f'P_pump {p_dh_f:.0f} bar', f'P_FRHC {p_frhc:.0f} bar'],
             p_dh_f)
 
-        # valvole MOV / MFV
         valve(1.7, 9.5, st[3]*100, 'MOV')
         valve(6.3, 9.5, st[4]*100, 'MFV')
 
@@ -478,7 +647,6 @@ class AppGUI:
         arrow(6.3, 9.14, 6.3, 8.85, color='#227755', lw=2.0,
               lbl=f'{p_man_f_pb:.0f} bar', lbl_col='#005533')
 
-        # cross-bleed
         v_frhc_pct = st[6] * 100
         v_orhc_pct = st[5] * 100
         cb_frhc = float(np.clip(st[6], 0, 1))
@@ -493,12 +661,10 @@ class AppGUI:
               lw=1.2 + 2.5 * cb_orhc, rad=0.3,
               lbl=f'v_orhc {v_orhc_pct:.0f}%', lbl_col='#005533')
 
-        # jacket label
         ax.text(6.3, 9.0, f'JACKET\nT={t_cool:.0f} K',
                 ha='center', va='center', fontsize=8,
                 color='#8B0000', zorder=4, fontweight='bold')
 
-        # ── ORHC  /  FRHC ─────────────────────────────────────────────────────
         box(0.2, 5.8, 3.0, 2.4, 'ORHC  (ox-rich)',
             [f'P  {p_orhc:.0f} bar',
              f'T  {t_orhc:.0f} K',
@@ -510,7 +676,6 @@ class AppGUI:
              f'O/F  {of_frhc:.2f}'],
             p_frhc)
 
-        # ── Helper box piccolo per turbina e iniettori ────────────────────────
         def small_box(cx, cy, title, dp_bar, p_ref, color_edge, color_text, w=1.35, h=0.90):
             pct = dp_bar / max(p_ref, 1.0) * 100.0
             if 10.0 <= pct <= 20.0:
@@ -536,48 +701,39 @@ class AppGUI:
                     ha='center', va='center', fontsize=7.0,
                     color=color_text, zorder=6, fontweight='bold')
 
-        # Salti di pressione turbina
         dp_turb_ox = max(p_orhc - p_man_ox, 0.0)
         dp_turb_f  = max(p_frhc - p_man_f,  0.0)
 
-        # ── Box INIETTORI PRE-BURNER (valve outlet → preburner) ───────────────
         small_box(1.7, 8.55, 'INJ LOX→ORHC', dp_inj_ox_orhc, p_orhc, '#336699', '#003388', w=1.4, h=0.65)
         small_box(6.3, 8.55, 'INJ CH4→FRHC', dp_inj_f_frhc,  p_frhc, '#227755', '#005533', w=1.4, h=0.65)
         arrow(1.7, 8.22, 1.7, 8.10, color='#336699', lw=2.0)
         arrow(6.3, 8.22, 6.3, 8.10, color='#227755', lw=2.0)
 
-        # ── Frecce ORHC → TURBINA ─────────────────────────────────────────────
         arrow(1.9, 5.8, 1.55, 5.25, color='#336699', lw=2.2,
               lbl=f'{p_orhc:.0f} bar', lbl_col='#003388')
         arrow(6.1, 5.8, 6.45, 5.25, color='#227755', lw=2.2,
               lbl=f'{p_frhc:.0f} bar', lbl_col='#005533')
 
-        # ── Box TURBINA ────────────────────────────────────────────────────────
         small_box(1.55, 4.82, 'TURBINA  OX', dp_turb_ox, p_orhc, '#336699', '#003388')
         small_box(6.45, 4.82, 'TURBINA FUEL', dp_turb_f,  p_frhc, '#227755', '#005533')
 
-        # ── Frecce TURBINA → INIETTORI ────────────────────────────────────────
         arrow(1.55, 4.37, 1.55, 3.92, color='#336699', lw=2.2,
               lbl=f'{p_man_ox:.0f} bar', lbl_col='#003388')
         arrow(6.45, 4.37, 6.45, 3.92, color='#227755', lw=2.2,
               lbl=f'{p_man_f:.0f} bar', lbl_col='#005533')
 
-        # ── Box INIETTORI ─────────────────────────────────────────────────────
         small_box(1.55, 3.52, 'INJECTOR  OX', dp_inj_ox, p_mcc, '#336699', '#003388')
         small_box(6.45, 3.52, 'INJECTOR FUEL', dp_inj_f,  p_mcc, '#227755', '#005533')
 
-        # ── Frecce INIETTORI → MCC ────────────────────────────────────────────
         arrow(1.90, 3.07, 2.5, 2.90, color='#336699', lw=2.2)
         arrow(6.10, 3.07, 5.5, 2.90, color='#227755', lw=2.2)
 
-        # ── MCC ───────────────────────────────────────────────────────────────
         box(2.0, 1.5, 4.0, 1.7, 'MAIN COMBUSTION CHAMBER',
             [f'P_mcc  {p_mcc:.0f} bar',
              f'T_ad   {CEA_MethaloxCombustion.get_t_ad(max(of_mcc, 0.15), p_mcc):.0f} K',
              f'O/F    {of_mcc:.2f}'],
             p_mcc)
 
-        # ── NOZZLE / THRUST ───────────────────────────────────────────────────
         nozzle_col = _pcol(p_mcc * 0.05, p_max=50)
         noz_patch = mpatches.Polygon(
             [[2.8, 1.5], [5.2, 1.5], [5.7, 0.2], [2.3, 0.2]],
@@ -593,7 +749,6 @@ class AppGUI:
                 ha='center', va='center', fontsize=8.5,
                 color='black', zorder=5, fontweight='bold')
 
-        # ── Barra colormap pressione ───────────────────────────────────────────
         grad_x = np.linspace(0.3, 7.7, 80)
         dw = grad_x[1] - grad_x[0]
         for i, gx in enumerate(grad_x[:-1]):
@@ -613,7 +768,6 @@ class AppGUI:
         ax.set_title('MONITORAGGIO STRUTTURALE — MARGINI DI SICUREZZA',
                      fontsize=11, fontweight='bold', color=COL_TEXT, pad=8)
 
-        # Raccolta dati dal motore
         p_mcc    = st[0] / 1e5
         w_ox     = st[1]
         w_f      = st[2]
@@ -622,20 +776,20 @@ class AppGUI:
         t_orhc   = engine.t_orhc_current
         t_frhc   = engine.t_frhc_current
 
-        # Dati profilo completo dal modello ugello
         sm = engine.spatial_nozzle
         p_cool_bar = getattr(engine, 'coolant_pressure_bar', 200.0)
         try:
             i_throat = int(np.argmin(sm.A))
             t_wall_throat_gas  = float(sm.T_hw_rad[i_throat, 0])
             t_wall_throat_cool = float(sm.T_hw_rad[i_throat, -1])
+            t_jacket_scalar = float(sm.t_cw[0]) if hasattr(sm.t_cw, '__len__') else float(sm.t_cw)
             res_wall = self.struct_analyzer.chamber_wall_profile(
                 p_mcc,
                 p_cool_bar,
                 sm.x,
                 sm.r,
                 sm.t_hw_profile,
-                sm.t_cw,
+                t_jacket_scalar,
                 sm.T_hw_rad[:, 0],
                 sm.T_hw_rad[:, -1],
                 sm.M,
@@ -646,11 +800,10 @@ class AppGUI:
             t_wall_throat_cool = 300.0
             res_wall = self.struct_analyzer.chamber_wall_profile(
                 p_mcc, p_cool_bar,
-                sm.x, sm.r, sm.t_hw_profile, sm.t_cw,
+                sm.x, sm.r, sm.t_hw_profile, 0.005,
                 np.full_like(sm.x, 600.0), np.full_like(sm.x, 300.0), sm.M,
             )
 
-        # Calcolo MoS
         results = [
             res_wall,
             self.struct_analyzer.nozzle_throat(t_wall_throat_gas, t_wall_throat_cool),
@@ -660,7 +813,6 @@ class AppGUI:
             self.struct_analyzer.preburner_vessel(p_frhc, label='FRHC — Involucro'),
         ]
 
-        # Layout verticale: 6 righe
         row_h  = 1.45
         y_top  = 9.2
         bar_x0 = 5.2
@@ -672,7 +824,6 @@ class AppGUI:
             color = StructuralAnalyzer.mos_color(mos)
             status = StructuralAnalyzer.mos_label(mos)
 
-            # Sfondo riga alternato
             bg_col = '#1e2d3d' if idx % 2 == 0 else '#182535'
             ax.add_patch(mpatches.FancyBboxPatch(
                 (0.1, y - 0.55), 9.8, row_h - 0.08,
@@ -681,28 +832,22 @@ class AppGUI:
                 linewidth=1, zorder=1, alpha=0.9,
             ))
 
-            # Label componente
             ax.text(0.3, y + 0.35, res['label'],
                     ha='left', va='center', fontsize=9, fontweight='bold',
                     color=COL_TEXT, zorder=3)
-
-            # Dettaglio
             ax.text(0.3, y - 0.12, res.get('detail', ''),
                     ha='left', va='center', fontsize=7.5,
                     color='#95a5a6', family='monospace', zorder=3)
 
-            # Barra MoS
             mos_clipped = float(np.clip(mos, -1.0, 3.0))
-            bar_frac    = (mos_clipped + 1.0) / 4.0   # -1..3 → 0..1
+            bar_frac    = (mos_clipped + 1.0) / 4.0
             bar_filled  = bar_frac * bar_w
-            # sfondo barra
             ax.add_patch(mpatches.FancyBboxPatch(
                 (bar_x0, y - 0.05), bar_w, 0.32,
                 boxstyle="round,pad=0.03",
                 facecolor='#2c3e50', edgecolor='#4a6080',
                 linewidth=1, zorder=2,
             ))
-            # riempimento
             if bar_filled > 0.01:
                 ax.add_patch(mpatches.FancyBboxPatch(
                     (bar_x0, y - 0.05), bar_filled, 0.32,
@@ -710,12 +855,10 @@ class AppGUI:
                     facecolor=color, edgecolor='none',
                     linewidth=0, zorder=3, alpha=0.85,
                 ))
-            # linea zero (MoS=0 → bar_frac=0.25)
             zero_x = bar_x0 + 0.25 * bar_w
             ax.plot([zero_x, zero_x], [y - 0.08, y + 0.30],
                     color='#e74c3c', lw=1.5, zorder=4)
 
-            # Valore MoS e status
             ax.text(bar_x0 + bar_w + 0.15, y + 0.12,
                     f'MoS = {mos:+.2f}',
                     ha='left', va='center', fontsize=9, fontweight='bold',
@@ -725,7 +868,6 @@ class AppGUI:
                     ha='left', va='center', fontsize=8, fontweight='bold',
                     color=color, zorder=4)
 
-        # Legenda semaforo
         ax.text(0.3, 0.35, '●', color='#2ecc71', fontsize=12, zorder=4)
         ax.text(0.7, 0.35, 'OK (MoS ≥ 0.25)', color='#95a5a6', fontsize=8, va='center', zorder=4)
         ax.text(3.2, 0.35, '●', color='#f39c12', fontsize=12, zorder=4)
@@ -733,152 +875,158 @@ class AppGUI:
         ax.text(7.0, 0.35, '●', color='#e74c3c', fontsize=12, zorder=4)
         ax.text(7.4, 0.35, 'FAILURE', color='#95a5a6', fontsize=8, va='center', zorder=4)
 
-    # ── Loop di simulazione ───────────────────────────────────────────────────
-    def _update_sim(self):
-        curr_thrust = self.engine.get_current_thrust()
-        st          = self.engine.state
+    # ── GUI update loop ───────────────────────────────────────────────────────
+    def _update_gui(self):
+        """Chiamato dal mainloop Tkinter: drena la coda e aggiorna la UI."""
+        # Drena tutti gli snapshot accumulati; aggiorna lo storico per ognuno,
+        # ma renderizza solo l'ultimo (evita N draw_idle() per ogni tick GUI).
+        snap = None
+        while True:
+            try:
+                new_snap = self._sim_queue.get_nowait()
+            except queue.Empty:
+                break
 
-        telemetry  = (st[0] / 1e5, st[1], st[2], st[7],
-                      self.engine.of_orhc_current, self.engine.of_frhc_current,
-                      st[8], st[9], self.engine.mdot_ox_last, self.engine.mdot_f_last)
-        cav_status = (self.engine.tp_ox.is_cavitating, self.engine.tp_fuel.is_cavitating)
+            # Accumula ogni snapshot nella storia
+            st          = new_snap['st']
+            t           = new_snap['current_time']
+            curr_thrust = new_snap['curr_thrust']
+            state_str   = new_snap['state_str']
 
-        th_mov, th_mfv, v_orhc, v_frhc, v_auto_ox, v_auto_f, is_ignited, state_str = \
-            self.fc.update(self.target_thrust, curr_thrust, telemetry, cav_status)
+            for k in self.hist:
+                self.hist[k].pop(0)
 
-        self.engine.cmd_th_mov    = th_mov
-        self.engine.cmd_th_mfv    = th_mfv
-        self.engine.cmd_v_orhc    = v_orhc
-        self.engine.cmd_v_frhc    = v_frhc
-        self.engine.cmd_v_auto_ox = v_auto_ox
-        self.engine.cmd_v_auto_f  = v_auto_f
-        self.engine.is_ignited    = is_ignited
+            self.hist['t'].append(t)
+            self.hist['th'].append(curr_thrust)
+            self.hist['th_tgt'].append(self.target_thrust if state_str == "MAIN_STAGE"
+                                       else 0.0)
+            self.hist['p_mcc'].append(st[0] / 1e5)
+            self.hist['p_orhc'].append(st[12] / 1e5)
+            self.hist['p_frhc'].append(st[13] / 1e5)
+            self.hist['of_orhc'].append(new_snap['of_orhc_current'])
+            self.hist['of_frhc'].append(new_snap['of_frhc_current'])
+            self.hist['w_ox'].append(st[1])
+            self.hist['w_f'].append(st[2])
+            self.hist['t_cool'].append(st[7])
+            self.hist['p_tank_ox'].append(st[8])
+            self.hist['p_tank_f'].append(st[9])
+            self.hist['v_mov'].append(st[3] * 100)
+            self.hist['v_mfv'].append(st[4] * 100)
+            self.hist['v_orhc'].append(st[5] * 100)
+            self.hist['v_frhc'].append(st[6] * 100)
+            self.hist['v_auto_ox'].append(st[10] * 100)
+            self.hist['v_auto_f'].append(st[11] * 100)
+            self.hist['mdot_ox'].append(new_snap['mdot_ox_last'])
+            self.hist['mdot_f'].append(new_snap['mdot_f_last'])
 
-        # Avanzamento del modello matematico (pesante su CPU durante i transitori)
-        self.engine.step(self.dt)
+            snap = new_snap   # tieni solo l'ultimo per il rendering
 
-        for k in self.hist:
-            self.hist[k].pop(0)
+        if snap is None:
+            # Nessun dato nuovo: rischedula e torna
+            self.root.after(16, self._update_gui)
+            return
 
-        t = self.engine.current_time
-        self.hist['t'].append(t)
-        self.hist['th'].append(curr_thrust)
-        self.hist['th_tgt'].append(self.target_thrust if state_str == "MAIN_STAGE" else 0.0)
-        self.hist['p_mcc'].append(st[0] / 1e5)
-        self.hist['p_orhc'].append(st[12] / 1e5)
-        self.hist['p_frhc'].append(st[13] / 1e5)
-        self.hist['of_orhc'].append(self.engine.of_orhc_current)
-        self.hist['of_frhc'].append(self.engine.of_frhc_current)
-        self.hist['w_ox'].append(st[1])
-        self.hist['w_f'].append(st[2])
-        self.hist['t_cool'].append(st[7])
-        self.hist['p_tank_ox'].append(st[8])
-        self.hist['p_tank_f'].append(st[9])
-        self.hist['v_mov'].append(st[3] * 100)
-        self.hist['v_mfv'].append(st[4] * 100)
-        self.hist['v_orhc'].append(st[5] * 100)
-        self.hist['v_frhc'].append(st[6] * 100)
-        self.hist['v_auto_ox'].append(st[10] * 100)
-        self.hist['v_auto_f'].append(st[11] * 100)
-        self.hist['mdot_ox'].append(self.engine.mdot_ox_last)
-        self.hist['mdot_f'].append(self.engine.mdot_f_last)
+        self._last_snap = snap
 
-        # THROTTLING DELLA GUI: Aggiorniamo Matplotlib solo 1 volta ogni 4 frame
-        # per evitare che ax.clear() saturi la coda di Tkinter causando il blocco.
-        self._frame_count = getattr(self, '_frame_count', 0) + 1
-        
-        if self._frame_count % 4 == 0:
-            state_colors = {
-                "IDLE":       "#4a4a4a",
-                "CHILLDOWN":  "#2980b9",
-                "SPIN_PRIME": "#e67e22",
-                "IGNITION":   "#d35400",
-                "RAMP_UP":    "#f39c12",
-                "MAIN_STAGE": "#27ae60",
-                "MECO":       "#8e44ad",
-                "ABORT":      "#c0392b",
-            }
-            self.lbl_state.config(text=f"  {state_str}  ",
-                                  bg=state_colors.get(state_str, "#4a4a4a"))
-            self.lbl_abort.config(text=self.fc.abort_reason)
+        # ── Aggiorna SEMPRE label e grafici temporali (leggeri, 1 chiamata = 1 snap) ──
+        st          = snap['st']
+        t           = snap['current_time']
+        curr_thrust = snap['curr_thrust']
+        state_str   = snap['state_str']
+        engine      = self._make_engine_proxy(snap)
 
-            cool_p_bar = self.engine.coolant_pressure_bar
-            phase      = CH4RealGasProps.phase_label(st[7], cool_p_bar)
-            mdot_ox    = self.engine.mdot_ox_last
-            mdot_f     = self.engine.mdot_f_last
-            of_mcc     = mdot_ox / max(mdot_f, 0.01) if mdot_f > 0.01 else 0.0
+        state_colors = {
+            "IDLE":       "#4a4a4a",
+            "CHILLDOWN":  "#2980b9",
+            "SPIN_PRIME": "#e67e22",
+            "IGNITION":   "#d35400",
+            "RAMP_UP":    "#f39c12",
+            "MAIN_STAGE": "#27ae60",
+            "MECO":       "#8e44ad",
+            "ABORT":      "#c0392b",
+        }
+        self.lbl_state.config(text=f"  {state_str}  ",
+                              bg=state_colors.get(state_str, "#4a4a4a"))
+        self.lbl_abort.config(text=snap['abort_reason'])
 
-            self.lbl_tel_perf.config(text=(
-                f"THRUST : {curr_thrust:8.1f} kN\n"
-                f"P_MCC  : {st[0]/1e5:8.1f} bar\n"
-                f"T_COOL : {st[7]:8.1f} K  [{phase}]\n"
-                f"P_COOL : {cool_p_bar:8.1f} bar"
-            ))
-            self.lbl_tel_pb.config(text=(
-                f"P_ORHC : {st[12]/1e5:8.1f} bar\n"
-                f"T_ORHC : {self.engine.t_orhc_current:8.1f} K\n"
-                f"O/F    : {self.engine.of_orhc_current:8.2f}\n"
-                f"P_FRHC : {st[13]/1e5:8.1f} bar\n"
-                f"T_FRHC : {self.engine.t_frhc_current:8.1f} K\n"
-                f"O/F    : {self.engine.of_frhc_current:8.2f}"
-            ))
-            self.lbl_tel_sys.config(text=(
-                f"OX RPM : {st[1]:8.0f}\n"
-                f"FL RPM : {st[2]:8.0f}\n"
-                f"P_LOX  : {st[8]:8.2f} bar\n"
-                f"P_LCH4 : {st[9]:8.2f} bar"
-            ))
-            self.lbl_tel_mdot.config(text=(
-                f"ṁ LOX  : {mdot_ox:8.1f} kg/s\n"
-                f"ṁ CH4  : {mdot_f:8.1f} kg/s\n"
-                f"O/F MCC: {of_mcc:8.2f}"
-            ))
-            self.lbl_tel_v.config(text=(
-                f"MOV    : {st[3]*100:6.1f} %\n"
-                f"MFV    : {st[4]*100:6.1f} %\n"
-                f"V_ORHC : {st[5]*100:6.1f} %\n"
-                f"V_FRHC : {st[6]*100:6.1f} %\n"
-                f"V_A_OX : {st[10]*100:6.1f} %\n"
-                f"V_A_FL : {st[11]*100:6.1f} %"
-            ))
+        cool_p_bar = snap['coolant_pressure_bar']
+        phase      = CH4RealGasProps.phase_label(st[7], cool_p_bar)
+        mdot_ox    = snap['mdot_ox_last']
+        mdot_f     = snap['mdot_f_last']
+        of_mcc     = mdot_ox / max(mdot_f, 0.01) if mdot_f > 0.01 else 0.0
 
-            T_hist = self.hist['t']
-            self.l_th.set_data(T_hist, self.hist['th'])
-            self.l_tgt.set_data(T_hist, self.hist['th_tgt'])
-            self.l_pmcc.set_data(T_hist, self.hist['p_mcc'])
-            self.l_porhc.set_data(T_hist, self.hist['p_orhc'])
-            self.l_pfrhc.set_data(T_hist, self.hist['p_frhc'])
-            self.l_of_orhc.set_data(T_hist, self.hist['of_orhc'])
-            self.l_of_frhc.set_data(T_hist, self.hist['of_frhc'])
-            self.l_wox.set_data(T_hist, self.hist['w_ox'])
-            self.l_wf.set_data(T_hist, self.hist['w_f'])
-            self.l_tcool.set_data(T_hist, self.hist['t_cool'])
-            self.l_ptank_ox.set_data(T_hist, self.hist['p_tank_ox'])
-            self.l_ptank_f.set_data(T_hist, self.hist['p_tank_f'])
-            self.l_v_mov.set_data(T_hist, self.hist['v_mov'])
-            self.l_v_mfv.set_data(T_hist, self.hist['v_mfv'])
-            self.l_v_auto_ox.set_data(T_hist, self.hist['v_auto_ox'])
-            self.l_v_auto_f.set_data(T_hist, self.hist['v_auto_f'])
-            self.l_mdot_ox.set_data(T_hist, self.hist['mdot_ox'])
-            self.l_mdot_f.set_data(T_hist, self.hist['mdot_f'])
+        self.lbl_tel_perf.config(text=(
+            f"THRUST : {curr_thrust:8.1f} kN\n"
+            f"P_MCC  : {st[0]/1e5:8.1f} bar\n"
+            f"T_COOL : {st[7]:8.1f} K  [{phase}]\n"
+            f"P_COOL : {cool_p_bar:8.1f} bar"
+        ))
+        self.lbl_tel_pb.config(text=(
+            f"P_ORHC : {st[12]/1e5:8.1f} bar\n"
+            f"T_ORHC : {snap['t_orhc_current']:8.1f} K\n"
+            f"O/F    : {snap['of_orhc_current']:8.2f}\n"
+            f"P_FRHC : {st[13]/1e5:8.1f} bar\n"
+            f"T_FRHC : {snap['t_frhc_current']:8.1f} K\n"
+            f"O/F    : {snap['of_frhc_current']:8.2f}"
+        ))
+        self.lbl_tel_sys.config(text=(
+            f"OX RPM : {st[1]:8.0f}\n"
+            f"FL RPM : {st[2]:8.0f}\n"
+            f"P_LOX  : {st[8]:8.2f} bar\n"
+            f"P_LCH4 : {st[9]:8.2f} bar"
+        ))
+        self.lbl_tel_mdot.config(text=(
+            f"ṁ LOX  : {mdot_ox:8.1f} kg/s\n"
+            f"ṁ CH4  : {mdot_f:8.1f} kg/s\n"
+            f"O/F MCC: {of_mcc:8.2f}"
+        ))
+        self.lbl_tel_v.config(text=(
+            f"MOV    : {st[3]*100:6.1f} %\n"
+            f"MFV    : {st[4]*100:6.1f} %\n"
+            f"V_ORHC : {st[5]*100:6.1f} %\n"
+            f"V_FRHC : {st[6]*100:6.1f} %\n"
+            f"V_A_OX : {st[10]*100:6.1f} %\n"
+            f"V_A_FL : {st[11]*100:6.1f} %"
+        ))
 
-            window = 20.0
-            min_x  = max(0.0, t - window)
-            max_x  = max(window, t)
-            for ax in self._time_axes:
-                ax.set_xlim(min_x, max_x)
+        T_hist = self.hist['t']
+        self.l_th.set_data(T_hist, self.hist['th'])
+        self.l_tgt.set_data(T_hist, self.hist['th_tgt'])
+        self.l_pmcc.set_data(T_hist, self.hist['p_mcc'])
+        self.l_porhc.set_data(T_hist, self.hist['p_orhc'])
+        self.l_pfrhc.set_data(T_hist, self.hist['p_frhc'])
+        self.l_of_orhc.set_data(T_hist, self.hist['of_orhc'])
+        self.l_of_frhc.set_data(T_hist, self.hist['of_frhc'])
+        self.l_wox.set_data(T_hist, self.hist['w_ox'])
+        self.l_wf.set_data(T_hist, self.hist['w_f'])
+        self.l_tcool.set_data(T_hist, self.hist['t_cool'])
+        self.l_ptank_ox.set_data(T_hist, self.hist['p_tank_ox'])
+        self.l_ptank_f.set_data(T_hist, self.hist['p_tank_f'])
+        self.l_v_mov.set_data(T_hist, self.hist['v_mov'])
+        self.l_v_mfv.set_data(T_hist, self.hist['v_mfv'])
+        self.l_v_auto_ox.set_data(T_hist, self.hist['v_auto_ox'])
+        self.l_v_auto_f.set_data(T_hist, self.hist['v_auto_f'])
+        self.l_mdot_ox.set_data(T_hist, self.hist['mdot_ox'])
+        self.l_mdot_f.set_data(T_hist, self.hist['mdot_f'])
 
+        window = 20.0
+        min_x  = max(0.0, t - window)
+        max_x  = max(window, t)
+        for ax in self._time_axes:
+            ax.set_xlim(min_x, max_x)
+
+        # ── Throttle solo per pannello destro (pesante: clear + ridisegno) ─────
+        self._frame_count += 1
+        if self._frame_count % 3 == 0:
             if self._right_panel == "SCHEMA":
-                self._draw_schema(st, self.engine, state_str)
+                self._draw_schema(st, engine, state_str)
             elif self._right_panel == "STRUCT":
-                self._draw_struct(st, self.engine)
+                self._draw_struct(st, engine)
             else:
-                # Il modello 1D è già aggiornato dall'engine ad ogni step.
-                # La GUI legge direttamente i profili precalcolati.
-                sn = self.engine.spatial_nozzle
-                of_noz = self.engine.mdot_ox_last / max(self.engine.mdot_f_last, 0.01)
+                sn     = engine.spatial_nozzle
+                of_noz = snap['mdot_ox_last'] / max(snap['mdot_f_last'], 0.01)
                 P_bar  = st[0] / 1e5
-                if self.engine.is_ignited and self.engine.mdot_f_last > 0.01:
+                if snap['is_ignited'] and snap['mdot_f_last'] > 0.01:
                     T_camera = CEA_MethaloxCombustion.get_t_ad(of_noz, P_bar)
                     T_gas    = T_camera / sn.temp_ratio
                 else:
@@ -890,10 +1038,8 @@ class AppGUI:
                 self.l_cw.set_data(sn.x, sn.T_cw)
 
             self.canvas.draw_idle()
-            self.root.update_idletasks() # Obbliga Tkinter a processare gli eventi in background sbloccando la GUI
 
-        # Coda la prossima iterazione riducendo il delay per compensare i frame saltati
-        self.root.after(10, self._update_sim)
+        self.root.after(16, self._update_gui)
 
 
 if __name__ == "__main__":

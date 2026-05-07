@@ -9,7 +9,7 @@ import matplotlib.pyplot as plt
 
 from core.engine import FFSCC_Engine
 from core.avionics import FlightComputer
-from config import SIM_DT as DT, SIM_T_TOTAL as T_TOTAL, SIM_START_SEQ as START_SEQ, SIM_TARGET_KN as TARGET_KN, K_HEAD
+from config import SIM_DT as DT, SIM_T_TOTAL as T_TOTAL, SIM_START_SEQ as START_SEQ, SIM_TARGET_KN as TARGET_KN, K_HEAD_OX, K_HEAD_F
 
 N      = int(T_TOTAL / DT)
 engine = FFSCC_Engine()
@@ -45,7 +45,9 @@ for i in range(N):
 
     telemetry  = (st[0] / 1e5, st[1], st[2], st[7],
                   engine.of_orhc_current, engine.of_frhc_current, st[8], st[9],
-                  engine.mdot_ox_last, engine.mdot_f_last)
+                  engine.mdot_ox_last, engine.mdot_f_last,
+                  engine.p_dh_ox_bar, engine.p_dh_f_bar,
+                  st[12] / 1e5, st[13] / 1e5)
     cav_status = (engine.tp_ox.is_cavitating, engine.tp_fuel.is_cavitating)
 
     th_mov, th_mfv, v_orhc, v_frhc, v_auto_ox, v_auto_f, is_ignited, state_str = \
@@ -84,8 +86,8 @@ for i in range(N):
     if in_bootstrap or state_changed or i % 100 == 0 or state_str == "ABORT":
         p_orhc_bar = st[12] / 1e5
         p_frhc_bar = st[13] / 1e5
-        p_pump_ox  = st[8] + K_HEAD * st[1]**2
-        p_pump_f   = st[9] + K_HEAD * st[2]**2
+        p_pump_ox  = st[8] + K_HEAD_OX * st[1]**2
+        p_pump_f   = st[9] + K_HEAD_F  * st[2]**2
         print(f"{t:6.2f}s  {state_str:<12}  {curr_thrust:8.1f}kN  "
               f"P_MCC={st[0]/1e5:6.1f}  Ppump_ox={p_pump_ox:6.1f}  Ppump_f={p_pump_f:6.1f}  "
               f"P_ORHC={p_orhc_bar:6.1f}  P_FRHC={p_frhc_bar:6.1f}  "
