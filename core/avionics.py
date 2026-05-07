@@ -239,71 +239,110 @@ class FlightComputer:
                     if ki_m > 0:
                         self.pid_mixture.integral = target_trim / ki_m
             else:
-                # Post-hold o normal: rate limiter (skip nel post-hold)
-                if self._main_stage_hold_steps < 0:
-                    # Post-hold: skip rate limiter, internal_target = current_thrust
-                    self._main_stage_hold_steps += 1
+                # Post-hold: blended handoff da comandi held a PID output
+                if self._main_stage_hold_steps == 0 and not hasattr(self, '_blend_step'):
+                    self._main_stage_hold_steps = -1  # negative: blend done, never re-enter
+                    self._blend_total = 40
+                    self._blend_step = 0
                     self.internal_target_thrust = current_thrust
-                else:
+
+                if hasattr(self, '_blend_step') and self._blend_step < self._blend_total:
+                    self._blend_step += 1
+
+                    # Rate-limit internal_target verso target_thrust
                     self.internal_target_thrust = np.clip(
                         target_thrust,
                         self.internal_target_thrust - rate,
                         self.internal_target_thrust + rate,
                     )
 
-                curr_of  = mdot_ox / max(mdot_f, 0.01)
-
-                # Thrust PID con anti-windup basato su saturazione valvola
-                thrust_error = self.internal_target_thrust - current_thrust
-                ki_t = self.pid_thrust.ki
-                kp_t = self.pid_thrust.kp
-
-                # Calcola output candidato SENZA aggiornare l'integrale
-                th_candidate = kp_t * thrust_error + ki_t * self.pid_thrust.integral
-
-                # Calcola mixture trim (aggiorna il suo integrale)
-                of_trim = self.pid_mixture.compute_trim(self.target_of, curr_of, max_trim=TRIM_OF_MCC_MAX)
-
-                # Verifica se MOV sarebbe saturo
-                mov_candidate = th_candidate + of_trim
-                if mov_candidate >= 0.85 and thrust_error > 0:
-                    # Thrust ceiling più ampio per dare margine al mixture PID
-                    self.internal_target_thrust = min(
-                        self.internal_target_thrust,
-                        current_thrust + 200.0
-                    )
+                    curr_of  = mdot_ox / max(mdot_f, 0.01)
                     thrust_error = self.internal_target_thrust - current_thrust
-                    th_candidate = kp_t * thrust_error + ki_t * self.pid_thrust.integral
-                    if th_candidate + of_trim >= 0.95:
-                        self.pid_thrust.integral = (0.95 - of_trim - kp_t * thrust_error) / max(ki_t, 1e-9)
-                        th_candidate = kp_t * thrust_error + ki_t * self.pid_thrust.integral
-                    if th_candidate + of_trim >= 0.95:
-                        self.pid_thrust.integral = (0.95 - of_trim - kp_t * thrust_error) / max(ki_t, 1e-9)
-                        th_candidate = kp_t * thrust_error + ki_t * self.pid_thrust.integral
-                else:
-                    # Accumula integrale normalmente
+                    ki_t = self.pid_thrust.ki
+                    kp_t = self.pid_thrust.kp
+
                     self.pid_thrust.integral += thrust_error * self.dt
-                    max_int = 1.0 / ki_t if ki_t > 0 else 0
-                    self.pid_thrust.integral = max(-max_int, min(max_int, self.pid_thrust.integral))
+                    max_int_t = 1.0 / ki_t if ki_t > 0 else 0
+                    self.pid_thrust.integral = max(-max_int_t, min(max_int_t, self.pid_thrust.integral))
+
                     th_candidate = kp_t * thrust_error + ki_t * self.pid_thrust.integral
+                    of_trim = self.pid_mixture.compute_trim(self.target_of, curr_of, max_trim=TRIM_OF_MCC_MAX)
 
-                th_base = max(0.0, min(1.0, th_candidate))
-                th_mov = max(0.0, min(1.0, th_base + of_trim))
-                th_mfv = max(0.0, min(1.0, th_base - of_trim))
+                    th_base = max(0.0, min(1.0, th_candidate))
+                    pid_mov = max(0.0, min(1.0, th_base + of_trim))
+                    pid_mfv = max(0.0, min(1.0, th_base - of_trim))
 
-                # Boost OF quando MOV è saturo e OF è sotto target:
-                # chiudi MFV extra per alzare il rapporto O/F
-                # Boost OF integrale quando MOV è saturo e OF è sotto target:
-                # chiudi MFV extra per alzare il rapporto O/F (correzione limitata per stabilità)
-                if th_mov >= 0.85 and curr_of < self.target_of:
-                    of_deficit = self.target_of - curr_of
-                    self.of_boost_integral += of_deficit * self.dt
-                    self.of_boost_integral = max(0.0, min(0.30, self.of_boost_integral))
-                    extra_close = min(0.12, of_deficit * 0.10 + 0.10 * self.of_boost_integral)
-                    th_mfv = max(0.0, min(1.0, th_mfv - extra_close))
+                    alpha = min(1.0, self._blend_step / self._blend_total)
+                    th_mov = (1 - alpha) * self._transition_th_mov + alpha * pid_mov
+                    th_mfv = (1 - alpha) * self._transition_th_mfv + alpha * pid_mfv
+
+                    if self._blend_step >= self._blend_total:
+                        del self._blend_step
+                        del self._blend_total
+
+                    v_orhc = np.clip(VALVE_ORHC_NOMINAL - self.pid_orhc.compute_trim(self.target_of_orhc, of_orhc, max_trim=TRIM_ORHC_MAX), 0.0, 1.0)
+                    v_frhc = np.clip(VALVE_FRHC_NOMINAL + self.pid_frhc.compute_trim(self.target_of_frhc, of_frhc, max_trim=TRIM_FRHC_MAX), 0.0, 1.0)
+                    v_auto_ox = self.pid_tank_ox.compute(self.target_p_tank, p_tank_ox)
+                    v_auto_f  = self.pid_tank_f.compute(self.target_p_tank, p_tank_f)
                 else:
-                    # Decadimento integrale se OF è a target o MOV non saturo
-                    self.of_boost_integral *= 0.95
+                    # Normal: calcola PID da zero
+                    curr_of  = mdot_ox / max(mdot_f, 0.01)
+
+                    # Rate limiter verso target_thrust
+                    self.internal_target_thrust = np.clip(
+                        target_thrust,
+                        self.internal_target_thrust - rate,
+                        self.internal_target_thrust + rate,
+                    )
+
+                    thrust_error = self.internal_target_thrust - current_thrust
+                    ki_t = self.pid_thrust.ki
+                    kp_t = self.pid_thrust.kp
+
+                    # Calcola output candidato e mixture trim
+                    th_candidate = kp_t * thrust_error + ki_t * self.pid_thrust.integral
+                    of_trim = self.pid_mixture.compute_trim(self.target_of, curr_of, max_trim=TRIM_OF_MCC_MAX)
+
+                    # Normal: verifica se MOV sarebbe saturo
+                    mov_candidate = th_candidate + of_trim
+                    if mov_candidate >= 0.85 and thrust_error > 0:
+                        # Thrust ceiling più ampio per dare margine al mixture PID
+                        self.internal_target_thrust = min(
+                            self.internal_target_thrust,
+                            current_thrust + 200.0
+                        )
+                        thrust_error = self.internal_target_thrust - current_thrust
+                        th_candidate = kp_t * thrust_error + ki_t * self.pid_thrust.integral
+                        if th_candidate + of_trim >= 0.95:
+                            self.pid_thrust.integral = (0.95 - of_trim - kp_t * thrust_error) / max(ki_t, 1e-9)
+                            th_candidate = kp_t * thrust_error + ki_t * self.pid_thrust.integral
+                        if th_candidate + of_trim >= 0.95:
+                            self.pid_thrust.integral = (0.95 - of_trim - kp_t * thrust_error) / max(ki_t, 1e-9)
+                            th_candidate = kp_t * thrust_error + ki_t * self.pid_thrust.integral
+                    else:
+                        # Accumula integrale normalmente
+                        self.pid_thrust.integral += thrust_error * self.dt
+                        max_int = 1.0 / ki_t if ki_t > 0 else 0
+                        self.pid_thrust.integral = max(-max_int, min(max_int, self.pid_thrust.integral))
+                        th_candidate = kp_t * thrust_error + ki_t * self.pid_thrust.integral
+
+                    th_base = max(0.0, min(1.0, th_candidate))
+                    th_mov = max(0.0, min(1.0, th_base + of_trim))
+                    th_mfv = max(0.0, min(1.0, th_base - of_trim))
+
+                    # Boost OF quando MOV è saturo e OF è sotto target:
+                    # chiudi MFV extra per alzare il rapporto O/F
+                    # Boost OF integrale quando MOV è saturo e OF è sotto target:
+                    # chiudi MFV extra per alzare il rapporto O/F (correzione limitata per stabilità)
+                    if th_mov >= 0.85 and curr_of < self.target_of:
+                        of_deficit = self.target_of - curr_of
+                        self.of_boost_integral += of_deficit * self.dt
+                        self.of_boost_integral = max(0.0, min(0.30, self.of_boost_integral))
+                        extra_close = min(0.12, of_deficit * 0.10 + 0.10 * self.of_boost_integral)
+                        th_mfv = max(0.0, min(1.0, th_mfv - extra_close))
+                    else:
+                        # Decadimento integrale se OF è a target o MOV non saturo
+                        self.of_boost_integral *= 0.95
 
                 v_orhc = np.clip(VALVE_ORHC_NOMINAL - self.pid_orhc.compute_trim(self.target_of_orhc, of_orhc, max_trim=TRIM_ORHC_MAX), 0.0, 1.0)
                 v_frhc = np.clip(VALVE_FRHC_NOMINAL + self.pid_frhc.compute_trim(self.target_of_frhc, of_frhc, max_trim=TRIM_FRHC_MAX), 0.0, 1.0)

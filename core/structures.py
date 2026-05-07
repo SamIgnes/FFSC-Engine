@@ -40,8 +40,8 @@ class StructuralAnalyzer:
 
     # ── Geometria camera di combustione ───────────────────────────────────────
     _r_mcc        = 0.15     # m  — raggio interno camera
-    _t_mcc_cu     = 0.003    # m  — spessore rame
-    _t_mcc_in718  = 0.005    # m  — spessore Inconel 718 (camicia esterna)
+    _t_mcc_cu     = 0.0025   # m  — spessore liner rame (NARloy-Z / CuCrZr)
+    _t_mcc_in718  = 0.008    # m  — spessore Inconel 718 (camicia strutturale)
 
     # ── Geometria disco turbina ───────────────────────────────────────────────
     _r_disk_ox    = 0.085    # m  — raggio esterno disco turbopompa LOX
@@ -100,37 +100,39 @@ class StructuralAnalyzer:
         M_arr    = np.asarray(M_arr,        dtype=float)
 
         # ── Pressione gas statica locale (isoentropica) ────────────────────────
-        exp = gamma / (gamma - 1.0)
+        exp       = gamma / (gamma - 1.0)
         p_gas_pa  = p_mcc_bar * 1e5 / (1.0 + 0.5 * (gamma - 1.0) * M_arr**2) ** exp
-        p_cool_pa = p_cool_bar * 1e5
 
-        # ── Liner rame: carico netto gas-cool ──────────────────────────────────
-        dp_cu     = p_gas_pa - p_cool_pa                          # positivo se gas > cool
-        sigma_cu  = np.maximum(dp_cu, 0.0) * r_arr / np.maximum(t_cu, 1e-6)
+        # ── Pressione coolant CH4 locale lungo i canali ────────────────────────
+        # ΔP_friction massima alla gola (M=1, flusso max), minima alle estremità.
+        # Stima: p_cool locale = p_cool_bar × [0.1 + 0.9 × exp(-dist/L_ref)]
+        #   - alla gola (dist=0):          p_cool = p_cool_bar (100%)
+        #   - alle estremità (dist→∞):    p_cool = 0.1 × p_cool_bar (10% → 90% ΔP totale)
+        i_throat        = int(np.argmin(np.abs(M_arr - 1.0)))
+        dist_from_throat = np.abs(np.arange(len(x_arr)) - i_throat)
+        L_ref           = max(len(x_arr) * 0.35, 1.0)
+        decay           = np.exp(-dist_from_throat / L_ref)
+        p_cool_local    = p_cool_bar * 1e5 * (0.1 + 0.9 * decay)  # [Pa]
+
+        # ── Liner rame: sforzo da Δp = p_gas - p_cool ─────────────────────────
+        dp_cu     = p_gas_pa - p_cool_local
+        sigma_cu  = dp_cu * r_arr / np.maximum(t_cu, 1e-6)     # [Pa] sforzo reale
         sy_cu_arr = np.array([self._CuCrZr_sy_T(T) for T in T_gas])
-        # MoS liner: se in compressione poniamo MoS=10 (non governante)
+        # DEBUG (rimuovere dopo verifica):
+        if not hasattr(self, '_debug_printed'):
+            print(f"[DEBUG] p_gas [bar]: {p_gas_pa[0]/1e5:.0f} (inlet) | {p_gas_pa[i_throat]/1e5:.0f} (throat) | {p_gas_pa[-1]/1e5:.1f} (exit)")
+            print(f"[DEBUG] p_cool [bar]: {p_cool_local[0]/1e5:.0f} (inlet) | {p_cool_local[i_throat]/1e5:.0f} (throat) | {p_cool_local[-1]/1e5:.0f} (exit)")
+            print(f"[DEBUG] sigma_cu [MPa]: {sigma_cu[0]/1e6:.0f} | {sigma_cu[i_throat]/1e6:.0f} | {sigma_cu[-1]/1e6:.0f}")
+            self._debug_printed = True
         mos_cu = np.where(
-            dp_cu <= 0.0,
-            10.0,
-            (sy_cu_arr / self.FS_YIELD) / np.maximum(sigma_cu, 1.0) - 1.0
+            sigma_cu > 0.0,
+            (sy_cu_arr / self.FS_YIELD) / np.maximum(sigma_cu, 1.0) - 1.0,
+            (sy_cu_arr * 1.5 / self.FS_YIELD) / np.maximum(-sigma_cu, 1.0) - 1.0
         )
 
-        # ── Camicia Inconel 718: regge la pressione differenziale ─────────────
-        # Il raffreddamento copre tutto il profilo ma la pressione del refrigerante
-        # decresce lungo i canali. Stima conservativa: p_cool lineare da p_cool_bar
-        # alla gola (M=1) fino a p_gas_locale alle estremità (ΔP → 0 senza flow).
-        # In pratica: p_cool_effective = p_gas + (p_cool - p_gas) × decay
-        # dove decay = exp(-distance_from_throat / L_ref)
-        
-        # FIX: Calcolo corretto dell'indice della gola
-        i_throat_arr = int(np.argmin(np.abs(M_arr - 1.0)))
-        
-        dist_from_throat = np.abs(np.arange(len(x_arr)) - i_throat_arr)
-        L_ref    = max(len(x_arr) * 0.35, 1.0)                    # ~35% della lunghezza totale
-        decay    = np.exp(-dist_from_throat / L_ref)
-        p_cool_local = p_gas_pa + (p_cool_pa - p_gas_pa) * decay  # [Pa] lungo il profilo
-
-        r_jacket  = r_arr + t_cu                                   # raggio interno camicia
+        # ── Camicia Inconel 718: contiene la pressione del CH4 ──────────────────
+        # La camicia trattiene p_cool (interno) vs atmosfera (esterno).
+        r_jacket  = r_arr + t_cu
         sigma_in  = p_cool_local * r_jacket / max(float(t_jacket), 1e-6)
         T_jkt_arr = T_cool + 50.0                                  # stima conservativa
         sy_in_arr = np.array([self._IN718_sy_T(T) for T in T_jkt_arr])
@@ -157,15 +159,19 @@ class StructuralAnalyzer:
         zone = 'camera' if x_c < 0.0 else ('gola' if abs(x_c) < 0.02 else 'ugello')
 
         return {
-            'label':     'Parete Cu+IN718 — profilo',
-            'sigma_MPa': s_c / 1e6,
-            'sy_MPa':    sy_c / 1e6,
-            'mos':       mos,
-            'detail':    (f'x={x_c:.3f} m ({zone})  [{gov_label}]  '
-                          f'σ={s_c/1e6:.0f} MPa  Sy={sy_c/1e6:.0f} MPa  T={T_c:.0f} K'),
-            'x_crit':    x_c,
-            'mos_arr':   mos_combined,
-            'x_arr':     x_arr,
+            'label':         'Parete Cu+IN718 — profilo',
+            'sigma_MPa':     s_c / 1e6,
+            'sy_MPa':        sy_c / 1e6,
+            'mos':           mos,
+            'detail':        (f'x={x_c:.3f} m ({zone})  [{gov_label}]  '
+                              f'σ={s_c/1e6:.0f} MPa  Sy={sy_c/1e6:.0f} MPa  T={T_c:.0f} K'),
+            'x_crit':        x_c,
+            'mos_arr':       mos_combined,
+            'mos_cu_arr':    mos_cu,
+            'mos_in_arr':    mos_in,
+            'x_arr':         x_arr,
+            'sigma_cu_MPa':  sigma_cu / 1e6,
+            'sigma_in_MPa':  sigma_in / 1e6,
         }
 
     def turbine_rotor(self, rpm: float, t_K: float, label: str = 'Turbina',

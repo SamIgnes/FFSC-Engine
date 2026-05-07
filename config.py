@@ -25,8 +25,8 @@ RHO_LCH4_NOM     = 422.0  # [kg/m³] densità LCH4 nominale (fallback)
 # Sizing: ΔP = P_pump_out - P_tank = 413.5 bar
 #   LOX  RPM_des = 22000  → K_HEAD_OX = 413.5 / 22000² = 8.54e-7
 #   CH4  RPM_des = 30000  → K_HEAD_F  = 413.5 / 30000² = 4.59e-7
-K_HEAD_OX = 1.4742e-6  # [bar/RPM²] LOX pump  (RPM_des=22000, P_pump=720bar)
-K_HEAD_F  = 7.9278e-7  # [bar/RPM²] CH4 pump  (RPM_des=30000, P_pump=720bar)
+K_HEAD_OX = 1.5184e-6  # [bar/RPM²] LOX pump  (+3% for thrust target)
+K_HEAD_F  = 8.1656e-7  # [bar/RPM²] CH4 pump  (+3% for thrust target)
 
 # Turbopompa LOX
 TP_OX_INERTIA   = 6.750    # [kg·m²·30/π] inerzia LOX

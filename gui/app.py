@@ -425,12 +425,27 @@ class AppGUI:
         self._btn_schema.config(bg="#2980b9")
         self._btn_nozzle.config(bg="#4a4a4a")
         self._btn_struct.config(bg="#4a4a4a")
+        # Ricrea asse singolo per SCHEMA/NOZZLE
+        self.fig_right.clear()
+        self.ax_schema = self.fig_right.add_subplot(111)
+        self.ax_schema.set_facecolor(BG_FIG)
+        self.ax_schema.axis('off')
+        self.ax_struct_profile = None
+        self.ax_struct_summary = None
+        self.l_gas = self.l_hw_hot = self.l_hw_cold = self.l_cool = self.l_cw = None
 
     def _show_nozzle(self):
         self._right_panel = "NOZZLE"
         self._btn_schema.config(bg="#4a4a4a")
         self._btn_nozzle.config(bg="#16a085")
         self._btn_struct.config(bg="#4a4a4a")
+        # Ricrea asse singolo per SCHEMA/NOZZLE
+        self.fig_right.clear()
+        self.ax_schema = self.fig_right.add_subplot(111)
+        self.ax_schema.set_facecolor(BG_FIG)
+        self.ax_schema.axis('off')
+        self.ax_struct_profile = None
+        self.ax_struct_summary = None
         self._rebuild_nozzle_artists()
 
     def _show_struct(self):
@@ -438,24 +453,42 @@ class AppGUI:
         self._btn_schema.config(bg="#4a4a4a")
         self._btn_nozzle.config(bg="#4a4a4a")
         self._btn_struct.config(bg="#8e44ad")
+        # Ricrea assi per STRUCT: rame sopra, inconel sotto, riepilogo in fondo
+        self.fig_right.clear()
+        self.fig_right.subplots_adjust(
+            hspace=0.45, left=0.12, right=0.95, top=0.96, bottom=0.03
+        )
+        gs_r = self.fig_right.add_gridspec(3, 1, height_ratios=[1.4, 1.4, 0.9])
+        self.ax_struct_cu      = self.fig_right.add_subplot(gs_r[0, 0])
+        self.ax_struct_inconel = self.fig_right.add_subplot(gs_r[1, 0])
+        self.ax_struct_summary = self.fig_right.add_subplot(gs_r[2, 0])
+        self.ax_struct_profile = None
+        self.ax_schema         = None
 
     # ── Figure ────────────────────────────────────────────────────────────────
     def _build_figure(self, plot_frame):
-        self.fig = Figure(figsize=(15, 10), dpi=96)
+        # Split plot_frame in due: sinistra grafici temporali, destra pannello
+        plots_frame = tk.Frame(plot_frame, bg=BG_FIG)
+        plots_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        right_frame = tk.Frame(plot_frame, bg=BG_FIG)
+        right_frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
+
+        # ── Canvas grafici temporali ─────────────────────────────────────────
+        self.fig = Figure(figsize=(10, 10), dpi=96)
         self.fig.patch.set_facecolor(BG_FIG)
         self.fig.subplots_adjust(
             hspace=0.45, wspace=0.38,
             left=0.06, right=0.96, top=0.97, bottom=0.05,
         )
 
-        gs = self.fig.add_gridspec(5, 3)
+        gs = self.fig.add_gridspec(5, 1)
 
-        self.ax_t     = self.fig.add_subplot(gs[0, :2])
-        self.ax_pb    = self.fig.add_subplot(gs[1, :2])
-        self.ax_w     = self.fig.add_subplot(gs[2, :2])
-        self.ax_tank  = self.fig.add_subplot(gs[3, :2])
-        self.ax_v     = self.fig.add_subplot(gs[4, :2])
-        self.ax_schema = self.fig.add_subplot(gs[:, 2])
+        self.ax_t     = self.fig.add_subplot(gs[0, 0])
+        self.ax_pb    = self.fig.add_subplot(gs[1, 0])
+        self.ax_w     = self.fig.add_subplot(gs[2, 0])
+        self.ax_tank  = self.fig.add_subplot(gs[3, 0])
+        self.ax_v     = self.fig.add_subplot(gs[4, 0])
 
         # Panel 0: Spinta e P_MCC
         self.ax_pmcc = self.ax_t.twinx()
@@ -513,13 +546,27 @@ class AppGUI:
         self.ax_mdot.legend(loc="upper right", fontsize=9, facecolor=BG_AX, labelcolor=COL_TEXT, framealpha=0.8)
         self.ax_v.set_xlabel("Tempo (s)", fontsize=8, color=COL_TEXT)
 
-        self.ax_schema.set_facecolor(BG_FIG)
-        self.ax_schema.axis('off')
-        self.l_gas = self.l_hw_hot = self.l_hw_cold = self.l_cool = self.l_cw = None
-
-        self.canvas = FigureCanvasTkAgg(self.fig, master=plot_frame)
+        self.canvas = FigureCanvasTkAgg(self.fig, master=plots_frame)
         self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
         self._time_axes = [self.ax_t, self.ax_pb, self.ax_w, self.ax_tank, self.ax_v]
+
+        # ── Canvas pannello destro (SCHEMA/STRUCT/NOZZLE) ────────────────────
+        self.fig_right = Figure(figsize=(5, 10), dpi=96)
+        self.fig_right.patch.set_facecolor(BG_FIG)
+
+        # Assi iniziali per SCHEMA/NOZZLE (un singolo asse a tutto schermo)
+        self.ax_schema = self.fig_right.add_subplot(111)
+        self.ax_schema.set_facecolor(BG_FIG)
+        self.ax_schema.axis('off')
+
+        # Placeholder per assi STRUCT (creati on-demand)
+        self.ax_struct_profile = None
+        self.ax_struct_summary = None
+
+        self.l_gas = self.l_hw_hot = self.l_hw_cold = self.l_cool = self.l_cw = None
+
+        self.canvas_right = FigureCanvasTkAgg(self.fig_right, master=right_frame)
+        self.canvas_right.get_tk_widget().pack(fill=tk.BOTH, expand=True)
 
     # ── Schema motore ─────────────────────────────────────────────────────────
     def _draw_schema(self, st, engine, state_str):
@@ -757,17 +804,8 @@ class AppGUI:
         ax.text(0.3, 15.12, '0', ha='center', va='bottom', fontsize=7, color='#333333')
         ax.text(7.7, 15.12, '800 bar', ha='center', va='bottom', fontsize=7, color='#333333')
 
-    # ── Pannello strutturale ──────────────────────────────────────────────────
+    # ── Pannello strutturale: rame sopra, inconel sotto, riepilogo in fondo ──
     def _draw_struct(self, st, engine):
-        ax = self.ax_schema
-        ax.clear()
-        ax.set_facecolor(BG_AX)
-        ax.set_xlim(0, 10)
-        ax.set_ylim(0, 10)
-        ax.axis('off')
-        ax.set_title('MONITORAGGIO STRUTTURALE — MARGINI DI SICUREZZA',
-                     fontsize=11, fontweight='bold', color=COL_TEXT, pad=8)
-
         p_mcc    = st[0] / 1e5
         w_ox     = st[1]
         w_f      = st[2]
@@ -775,105 +813,116 @@ class AppGUI:
         p_frhc   = st[13] / 1e5
         t_orhc   = engine.t_orhc_current
         t_frhc   = engine.t_frhc_current
-
-        sm = engine.spatial_nozzle
+        sm       = engine.spatial_nozzle
         p_cool_bar = getattr(engine, 'coolant_pressure_bar', 200.0)
+
         try:
-            i_throat = int(np.argmin(sm.A))
-            t_wall_throat_gas  = float(sm.T_hw_rad[i_throat, 0])
-            t_wall_throat_cool = float(sm.T_hw_rad[i_throat, -1])
             t_jacket_scalar = float(sm.t_cw[0]) if hasattr(sm.t_cw, '__len__') else float(sm.t_cw)
             res_wall = self.struct_analyzer.chamber_wall_profile(
-                p_mcc,
-                p_cool_bar,
-                sm.x,
-                sm.r,
-                sm.t_hw_profile,
-                t_jacket_scalar,
-                sm.T_hw_rad[:, 0],
-                sm.T_hw_rad[:, -1],
-                sm.M,
-                gamma=1.14,
+                p_mcc, p_cool_bar, sm.x, sm.r, sm.t_hw_profile,
+                t_jacket_scalar, sm.T_hw_rad[:, 0], sm.T_hw_rad[:, -1], sm.M, gamma=1.14,
             )
         except Exception:
-            t_wall_throat_gas  = 800.0
-            t_wall_throat_cool = 300.0
             res_wall = self.struct_analyzer.chamber_wall_profile(
-                p_mcc, p_cool_bar,
-                sm.x, sm.r, sm.t_hw_profile, 0.005,
+                p_mcc, p_cool_bar, sm.x, sm.r, sm.t_hw_profile, 0.005,
                 np.full_like(sm.x, 600.0), np.full_like(sm.x, 300.0), sm.M,
             )
 
-        results = [
-            res_wall,
-            self.struct_analyzer.nozzle_throat(t_wall_throat_gas, t_wall_throat_cool),
-            self.struct_analyzer.turbine_rotor(w_ox, t_orhc, label='Rotore Turbina OX',  is_ox=True),
-            self.struct_analyzer.turbine_rotor(w_f,  t_frhc, label='Rotore Turbina FUEL', is_ox=False),
-            self.struct_analyzer.preburner_vessel(p_orhc, label='ORHC — Involucro'),
-            self.struct_analyzer.preburner_vessel(p_frhc, label='FRHC — Involucro'),
+        x_arr     = res_wall['x_arr']
+        sigma_cu  = res_wall['sigma_cu_MPa']
+        sigma_in  = res_wall['sigma_in_MPa']
+        mos_cu    = res_wall['mos_cu_arr']
+        mos_in    = res_wall['mos_in_arr']
+        mos_min   = res_wall['mos']
+        x_crit    = res_wall['x_crit']
+
+        # ── Grafico 1: Rame (Cu liner) ─────────────────────────────────────
+        ax1 = self.ax_struct_cu
+        ax1.clear()
+        ax1.set_facecolor(BG_AX)
+        ax1.set_xlim(min(x_arr) - 0.03, max(x_arr) + 0.03)
+        ax1.set_ylim(-20, max(sigma_cu) * 1.2 + 30)
+        ax1.set_ylabel("σ Cu  (MPa)", fontsize=7, color='#d35400', labelpad=1)
+        ax1.set_title("LINER RAME (CuCrZr / NARloy-Z)",
+                      fontsize=8, fontweight='bold', color=COL_TEXT, pad=3)
+        ax1.grid(True, color=COL_GRID, linewidth=0.4, alpha=0.6)
+        for sp in ax1.spines.values(): sp.set_edgecolor(COL_GRID)
+
+        ax1.plot(x_arr, sigma_cu, lw=2.0, color='#d35400')
+        # Evidenzia dove MoS < 0 (fallimento)
+        fail_mask = mos_cu < 0
+        if np.any(fail_mask):
+            ax1.fill_between(x_arr, 0, sigma_cu, where=fail_mask,
+                            color='#e74c3c', alpha=0.35, label='FAIL (MoS<0)')
+        ax1.axhline(y=0, color='#636e72', lw=0.8, linestyle=':')
+        ax1.text(x_crit, ax1.get_ylim()[1] * 0.92, f'★ {x_crit:.3f}m  MoS={mos_min:+.2f}',
+                ha='center', va='top', fontsize=6, fontweight='bold', color='#e74c3c',
+                bbox=dict(boxstyle='round,pad=0.2', facecolor=BG_AX, alpha=0.9))
+        ax1.legend(loc='upper right', fontsize=6, facecolor=BG_AX,
+                   labelcolor=COL_TEXT, framealpha=0.8)
+
+        # ── Grafico 2: Inconel (camicia) ───────────────────────────────────
+        ax2 = self.ax_struct_inconel
+        ax2.clear()
+        ax2.set_facecolor(BG_AX)
+        ax2.set_xlim(min(x_arr) - 0.03, max(x_arr) + 0.03)
+        ax2.set_ylim(-20, max(sigma_in) * 1.2 + 30)
+        ax2.set_xlabel("Coordinata assiale  x  (m)", fontsize=7, color=COL_TEXT)
+        ax2.set_ylabel("σ IN718  (MPa)", fontsize=7, color='#2980b9', labelpad=1)
+        ax2.set_title("CAMICIA INCONEL 718",
+                      fontsize=8, fontweight='bold', color=COL_TEXT, pad=3)
+        ax2.grid(True, color=COL_GRID, linewidth=0.4, alpha=0.6)
+        for sp in ax2.spines.values(): sp.set_edgecolor(COL_GRID)
+
+        ax2.plot(x_arr, sigma_in, lw=2.0, color='#2980b9')
+        fail_mask2 = mos_in < 0
+        if np.any(fail_mask2):
+            ax2.fill_between(x_arr, 0, sigma_in, where=fail_mask2,
+                             color='#e74c3c', alpha=0.35, label='FAIL (MoS<0)')
+        ax2.axhline(y=0, color='#636e72', lw=0.8, linestyle=':')
+        ax2.legend(loc='upper right', fontsize=6, facecolor=BG_AX,
+                   labelcolor=COL_TEXT, framealpha=0.8)
+
+        # ── Riepilogo altri componenti ──────────────────────────────────────
+        ax_sum = self.ax_struct_summary
+        ax_sum.clear()
+        ax_sum.set_facecolor('#182535')
+        ax_sum.axis('off')
+        ax_sum.set_xlim(0, 1)
+        ax_sum.set_ylim(0, 1)
+
+        res_throat = self.struct_analyzer.nozzle_throat(
+            float(sm.T_hw_rad[int(np.argmin(sm.A)), 0]),
+            float(sm.T_hw_rad[int(np.argmin(sm.A)), -1])
+        )
+        others = [
+            ('GOLETTO', res_throat),
+            ('TURB OX',   self.struct_analyzer.turbine_rotor(w_ox, t_orhc, label='', is_ox=True)),
+            ('TURB FUEL', self.struct_analyzer.turbine_rotor(w_f,  t_frhc, label='', is_ox=False)),
+            ('ORHC',      self.struct_analyzer.preburner_vessel(p_orhc, label='')),
+            ('FRHC',      self.struct_analyzer.preburner_vessel(p_frhc, label='')),
         ]
-
-        row_h  = 1.45
-        y_top  = 9.2
-        bar_x0 = 5.2
-        bar_w  = 4.2
-
-        for idx, res in enumerate(results):
-            y = y_top - idx * row_h
-            mos   = res['mos']
-            color = StructuralAnalyzer.mos_color(mos)
-            status = StructuralAnalyzer.mos_label(mos)
-
-            bg_col = '#1e2d3d' if idx % 2 == 0 else '#182535'
-            ax.add_patch(mpatches.FancyBboxPatch(
-                (0.1, y - 0.55), 9.8, row_h - 0.08,
-                boxstyle="round,pad=0.05",
-                facecolor=bg_col, edgecolor='#2c3e50',
-                linewidth=1, zorder=1, alpha=0.9,
+        n = len(others)
+        cell_w = 0.92 / n
+        for i, (name, r) in enumerate(others):
+            x0 = 0.04 + i * cell_w
+            mos = r['mos']
+            col = StructuralAnalyzer.mos_color(mos)
+            ax_sum.add_patch(mpatches.FancyBboxPatch(
+                (x0, 0.08), cell_w - 0.01, 0.85,
+                boxstyle='round,pad=0.02',
+                facecolor='#1e2d3d', edgecolor=col,
+                linewidth=1.2, alpha=0.95, zorder=2
             ))
-
-            ax.text(0.3, y + 0.35, res['label'],
-                    ha='left', va='center', fontsize=9, fontweight='bold',
-                    color=COL_TEXT, zorder=3)
-            ax.text(0.3, y - 0.12, res.get('detail', ''),
-                    ha='left', va='center', fontsize=7.5,
-                    color='#95a5a6', family='monospace', zorder=3)
-
-            mos_clipped = float(np.clip(mos, -1.0, 3.0))
-            bar_frac    = (mos_clipped + 1.0) / 4.0
-            bar_filled  = bar_frac * bar_w
-            ax.add_patch(mpatches.FancyBboxPatch(
-                (bar_x0, y - 0.05), bar_w, 0.32,
-                boxstyle="round,pad=0.03",
-                facecolor='#2c3e50', edgecolor='#4a6080',
-                linewidth=1, zorder=2,
-            ))
-            if bar_filled > 0.01:
-                ax.add_patch(mpatches.FancyBboxPatch(
-                    (bar_x0, y - 0.05), bar_filled, 0.32,
-                    boxstyle="round,pad=0.03",
-                    facecolor=color, edgecolor='none',
-                    linewidth=0, zorder=3, alpha=0.85,
-                ))
-            zero_x = bar_x0 + 0.25 * bar_w
-            ax.plot([zero_x, zero_x], [y - 0.08, y + 0.30],
-                    color='#e74c3c', lw=1.5, zorder=4)
-
-            ax.text(bar_x0 + bar_w + 0.15, y + 0.12,
-                    f'MoS = {mos:+.2f}',
-                    ha='left', va='center', fontsize=9, fontweight='bold',
-                    color=color, family='monospace', zorder=4)
-            ax.text(bar_x0 + bar_w + 0.15, y - 0.18,
-                    status,
-                    ha='left', va='center', fontsize=8, fontweight='bold',
-                    color=color, zorder=4)
-
-        ax.text(0.3, 0.35, '●', color='#2ecc71', fontsize=12, zorder=4)
-        ax.text(0.7, 0.35, 'OK (MoS ≥ 0.25)', color='#95a5a6', fontsize=8, va='center', zorder=4)
-        ax.text(3.2, 0.35, '●', color='#f39c12', fontsize=12, zorder=4)
-        ax.text(3.6, 0.35, 'CAUTION (0 ≤ MoS < 0.25)', color='#95a5a6', fontsize=8, va='center', zorder=4)
-        ax.text(7.0, 0.35, '●', color='#e74c3c', fontsize=12, zorder=4)
-        ax.text(7.4, 0.35, 'FAILURE', color='#95a5a6', fontsize=8, va='center', zorder=4)
+            ax_sum.text(x0 + cell_w/2, 0.78, name,
+                        ha='center', va='center', fontsize=6.5,
+                        fontweight='bold', color=COL_TEXT, zorder=3)
+            ax_sum.text(x0 + cell_w/2, 0.48, f"σ={r['sigma_MPa']:.0f}",
+                        ha='center', va='center', fontsize=6,
+                        color='#b2bec3', zorder=3)
+            ax_sum.text(x0 + cell_w/2, 0.22, f"MoS={mos:+.2f}",
+                        ha='center', va='center', fontsize=6.5,
+                        fontweight='bold', color=col, zorder=3)
 
     # ── GUI update loop ───────────────────────────────────────────────────────
     def _update_gui(self):
@@ -1015,6 +1064,9 @@ class AppGUI:
         for ax in self._time_axes:
             ax.set_xlim(min_x, max_x)
 
+        # ── Aggiorna canvas grafici temporali (sempre) ────────────────────────
+        self.canvas.draw_idle()
+
         # ── Throttle solo per pannello destro (pesante: clear + ridisegno) ─────
         self._frame_count += 1
         if self._frame_count % 3 == 0:
@@ -1037,7 +1089,7 @@ class AppGUI:
                 self.l_cool.set_data(sn.x, sn.T_cool)
                 self.l_cw.set_data(sn.x, sn.T_cw)
 
-            self.canvas.draw_idle()
+            self.canvas_right.draw_idle()
 
         self.root.after(16, self._update_gui)
 
